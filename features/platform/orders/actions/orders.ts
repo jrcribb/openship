@@ -67,6 +67,7 @@ export async function addToCart(itemData: any) {
       $variantId: String
       $quantity: String
       $orderId: ID
+      $lineItemId: String
     ) {
       addToCart(
         channelId: $channelId
@@ -77,6 +78,7 @@ export async function addToCart(itemData: any) {
         variantId: $variantId
         quantity: $quantity
         orderId: $orderId
+        lineItemId: $lineItemId
       ) {
         id
       }

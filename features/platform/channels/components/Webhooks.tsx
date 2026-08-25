@@ -20,6 +20,17 @@ import {
 
 
 
+function webhookTopics(webhook: any): string[] {
+  if (Array.isArray(webhook.topic)) return webhook.topic;
+  if (Array.isArray(webhook.topics)) return webhook.topics;
+  return webhook.topic ? [webhook.topic] : [];
+}
+
+function absoluteWebhookUrl(value: string): string {
+  if (typeof window === 'undefined') return value;
+  return new URL(value, window.location.origin).toString();
+}
+
 const WebhookItem = ({ webhook, onRefresh, channelId }: {
   webhook: any;
   onRefresh: () => void;
@@ -64,7 +75,7 @@ const WebhookItem = ({ webhook, onRefresh, channelId }: {
           <div className="rounded-full text-green-400 bg-green-400/20 p-1">
             <div className="h-2 w-2 rounded-full bg-current animate-pulse" />
           </div>
-          <span className="text-sm font-medium">{webhook.topic}</span>
+          <span className="text-sm font-medium">{webhookTopics(webhook).join(', ')}</span>
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -106,57 +117,37 @@ const RecommendedWebhookItem = ({ webhook, onRefresh, channelId }: {
   const { toast } = useToast();
 
   const handleEnable = async () => {
-    console.log("🔥 [CHANNEL WEBHOOK UI] Button clicked - Starting webhook creation");
-    console.log("🔥 [CHANNEL WEBHOOK UI] channelId:", channelId);
-    console.log("🔥 [CHANNEL WEBHOOK UI] webhook.topic:", webhook.topic);
-    console.log("🔥 [CHANNEL WEBHOOK UI] webhook.callbackUrl:", webhook.callbackUrl);
-    
-    // Get base URL and prepend to relative callback URL
-    const baseUrl = typeof window !== 'undefined' ? window.location.origin : "https://macbook-pro-3.tail272f03.ts.net";
-    const finalEndpoint = `${baseUrl}${webhook.callbackUrl}`;
-    console.log("🔥 [CHANNEL WEBHOOK UI] baseUrl:", baseUrl);
-    console.log("🔥 [CHANNEL WEBHOOK UI] finalEndpoint:", finalEndpoint);
-    
     setLoading(true);
     try {
-      console.log("🔥 [CHANNEL WEBHOOK UI] Calling createChannelWebhook with:", {
-        channelId,
-        topic: webhook.topic,
-        endpoint: finalEndpoint
-      });
-      
+      if (typeof window === 'undefined') {
+        throw new Error('Webhook setup requires a browser origin');
+      }
+      const finalEndpoint = new URL(webhook.callbackUrl, window.location.origin).toString();
       const response = await createChannelWebhook(
         channelId,
         webhook.topic,
         finalEndpoint
       );
 
-      console.log("🔥 [CHANNEL WEBHOOK UI] Response received:", response);
-
       if (response.success) {
-        console.log("🔥 [CHANNEL WEBHOOK UI] Success! Webhook created with ID:", (response as any).webhookId);
-        toast({
-          title: "Webhook enabled successfully",
-        });
+        toast({ title: 'Webhook enabled successfully' });
         onRefresh();
       } else {
-        console.error("🔥 [CHANNEL WEBHOOK UI] Failed to create webhook:", response.error);
         toast({
-          title: "Failed to enable webhook",
-          description: response.error || "Unknown error",
-          variant: "destructive",
+          title: 'Failed to enable webhook',
+          description: response.error || 'Unknown error',
+          variant: 'destructive',
         });
       }
     } catch (err: any) {
-      console.error("🔥 [CHANNEL WEBHOOK UI] Exception caught:", err);
-      console.error("🔥 [CHANNEL WEBHOOK UI] Exception stack:", err.stack);
       toast({
-        title: "Failed to enable webhook",
+        title: 'Failed to enable webhook',
         description: err.message,
-        variant: "destructive",
+        variant: 'destructive',
       });
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -239,7 +230,7 @@ export const Webhooks = ({ channelId, channel }: { channelId: string; channel?: 
         <div className="space-y-3">
           {webhooks.map((webhook: any) => (
             <WebhookItem
-              key={webhook.id}
+              key={`${webhook.id}-${webhookTopics(webhook).join('-')}`}
               webhook={webhook}
               onRefresh={invalidateChannels}
               channelId={channelId}
@@ -251,13 +242,10 @@ export const Webhooks = ({ channelId, channel }: { channelId: string; channel?: 
       {/* Disabled/Recommended webhooks */}
       <div className="space-y-3">
         {recommendedWebhooks.map((webhook: any) => {
-          const fullRecommendedUrl = (typeof window !== 'undefined' ? window.location.origin : '') + webhook.callbackUrl;
+          const fullRecommendedUrl = absoluteWebhookUrl(webhook.callbackUrl);
           const existingWebhook = webhooks.find(
-            (w: any) => {
-              const existingTopic = Array.isArray(w.topic) ? w.topic[0] : w.topic;
-              return existingTopic === webhook.topic &&
-                w.callbackUrl === fullRecommendedUrl;
-            }
+            (w: any) => webhookTopics(w).includes(webhook.topic) &&
+              absoluteWebhookUrl(w.callbackUrl) === fullRecommendedUrl
           );
           return !existingWebhook ? (
             <RecommendedWebhookItem

@@ -1,4 +1,5 @@
 import { getShopWebhooks as executeGetShopWebhooks } from "../../utils/shopProviderAdapter";
+import { requireWebhookOwner } from "../mutations/webhook-security";
 
 interface GetShopWebhooksArgs {
   shopId: string;
@@ -10,29 +11,21 @@ async function getShopWebhooks(
   context: any
 ) {
   try {
-    // Fetch the shop using the provided shopId
-    const shop = await context.query.Shop.findOne({
-      where: { id: shopId },
-      query: "id domain accessToken platform { id getWebhooksFunction }",
-    });
-
-    
-    if (!shop) {
-      throw new Error("Shop not found");
-    }
-
-    if (!shop.platform) {
-      throw new Error("Platform configuration not specified.");
+    const shop = await requireWebhookOwner(context, "shop", shopId);
+    if (!shop.platform?.getWebhooksFunction) {
+      throw new Error("Get webhooks function not configured.");
     }
 
     const result = await executeGetShopWebhooks({
       platform: {
-        ...shop.platform,
+        ...(shop.metadata || {}),
+        resourceId: shop.id,
+        id: shop.platform.id,
         domain: shop.domain,
         accessToken: shop.accessToken,
+        getWebhooksFunction: shop.platform.getWebhooksFunction,
       },
     });
-
     return result.webhooks;
   } catch (error: any) {
     throw new Error(`Error getting shop webhooks: ${error.message}`);

@@ -1,13 +1,19 @@
+import crypto from "crypto";
 import { GraphQLClient, gql } from "graphql-request";
 import { keystoneContext } from '@/features/keystone/context';
+import { openFrontChannelEvents } from '../openfront-webhook-topics';
+import { buildOpenFrontOAuthUrl } from '../lib/openfront-oauth-url';
 
 interface OpenFrontPlatform {
+  id?: string;
   domain: string;
   accessToken: string;
   refreshToken?: string;
   tokenExpiresAt?: Date | string;
   appKey?: string;
   appSecret?: string;
+  webhookSecret?: string;
+  resourceId?: string;
 }
 
 interface SearchProductsArgs {
@@ -24,6 +30,7 @@ interface CreatePurchaseArgs {
   cartItems: any[];
   shipping: any;
   notes?: string;
+  idempotencyKey?: string;
 }
 
 interface CreateWebhookArgs {
@@ -259,15 +266,21 @@ export async function getProductFunction({
   platform,
   productId,
   variantId,
+  currency,
 }: {
   platform: OpenFrontPlatform;
   productId: string;
   variantId?: string;
+  currency?: string;
 }) {
   const openFrontClient = await createOpenFrontClient(platform);
 
   const gqlQuery = gql`
-    query GetChannelProduct($productId: ID!, $variantWhere: ProductVariantWhereInput) {
+    query GetChannelProduct(
+      $productId: ID!
+      $variantWhere: ProductVariantWhereInput
+      $priceWhere: MoneyAmountWhereInput
+    ) {
       product(where: { id: $productId }) {
         id
         title
@@ -283,7 +296,7 @@ export async function getProductFunction({
           title
           sku
           inventoryQuantity
-          prices {
+          prices(where: $priceWhere) {
             id
             amount
             currency {
@@ -296,9 +309,13 @@ export async function getProductFunction({
     }
   `;
 
+  const currencyCode = String(currency || '').trim().toLowerCase();
   const { product } = await openFrontClient.request(gqlQuery, {
     productId,
     variantWhere: variantId ? { id: { equals: variantId } } : {},
+    priceWhere: currencyCode
+      ? { currency: { code: { equals: currencyCode } } }
+      : {},
   }) as any;
 
   if (!product || product.status !== "published") {
@@ -336,11 +353,13 @@ export async function createPurchaseFunction({
   platform,
   cartItems,
   shipping,
+  idempotencyKey,
 }: {
   platform: OpenFrontPlatform;
   cartItems: any[];
   shipping: any;
   notes?: string;
+  idempotencyKey?: string;
 }) {
   const openFrontClient = await createOpenFrontClient(platform);
 
@@ -369,89 +388,151 @@ export async function createPurchaseFunction({
       throw new Error(`No region found for currency: ${currencyCode}`);
     }
 
-    // Step 2: Create cart (following storefront flow)
-    const { createCart: cart } = await openFrontClient.request(gql`
-      mutation CreateCart($data: CartCreateInput!) {
-        createCart(data: $data) {
-          id
-          region {
+    // Step 2: create or recover the supplier cart by Openship's durable key.
+    const findExistingCart = async () => {
+      if (!idempotencyKey) return null;
+      const result = await openFrontClient.request(gql`
+        query FindSupplierCart($idempotencyKey: String!) {
+          carts(
+            where: { idempotencyKey: { equals: $idempotencyKey } }
+            take: 1
+          ) {
             id
-            currency {
+            region { id currency { id code } }
+            lineItems {
               id
-              code
+              quantity
+              metadata
+              productVariant { id }
             }
+            shippingAddress { id }
+            billingAddress { id }
+            order { id displayId total status }
           }
         }
+      `, { idempotencyKey }) as any;
+      return result.carts?.[0] || null;
+    };
+
+    let cart: any = await findExistingCart();
+    if (cart?.order?.id) {
+      return {
+        purchaseId: cart.order.id,
+        orderNumber: `#${cart.order.displayId}`,
+        totalPrice: cart.order.total,
+        url: `${platform.domain.replace(/\/$/, '')}/account/orders/details/${cart.order.id}`,
+        lineItems: cartItems.map((item: any) => ({
+          id: item.id,
+          title: item.name || `Product ${item.variantId}`,
+          quantity: item.quantity,
+          variantId: item.variantId,
+        })),
+        status: cart.order.status || 'pending',
+        reconciled: true,
+      };
+    }
+
+    if (!cart) {
+      try {
+        const result = await openFrontClient.request(gql`
+          mutation CreateCart($data: CartCreateInput!) {
+            createCart(data: $data) {
+              id
+              region { id currency { id code } }
+            }
+          }
+        `, {
+          data: {
+            region: { connect: { id: region.id } },
+            email: shipping?.email || `order-${Date.now()}@openship.generated`,
+            ...(idempotencyKey ? { idempotencyKey } : {}),
+          },
+        }) as any;
+        cart = { ...result.createCart, lineItems: [] };
+      } catch (error) {
+        // A concurrent retry may have created the same unique cart key.
+        cart = await findExistingCart();
+        if (!cart) throw error;
       }
-    `, {
-      data: {
-        region: { connect: { id: region.id } },
-        email: shipping?.email || `order-${Date.now()}@openship.generated`
-      }
-    }) as any;
+    }
 
     // Step 3: Add line items to cart (this computes unitPrice/total automatically)
     const lineItemsToCreate = [];
     for (const item of cartItems) {
       lineItemsToCreate.push({
         productVariant: { connect: { id: item.variantId } },
-        quantity: item.quantity
+        quantity: item.quantity,
+        metadata: {
+          openshipCartItemId: item.id,
+          openshipSourceLineItemId: item.lineItemId || null,
+        },
       });
     }
 
-    await openFrontClient.request(gql`
-      mutation AddLineItemsToCart($cartId: ID!, $data: CartUpdateInput!) {
-        updateActiveCart(cartId: $cartId, data: $data) {
-          id
-        }
+    if (cart.lineItems?.length) {
+      const existingByCartItem = new Map(
+        cart.lineItems.map((line: any) => [
+          String(line.metadata?.openshipCartItemId || ''),
+          line,
+        ])
+      );
+      const exactRecovery =
+        cart.lineItems.length === cartItems.length &&
+        cartItems.every((item: any) => {
+          const line: any = existingByCartItem.get(String(item.id));
+          return line &&
+            line.productVariant?.id === item.variantId &&
+            Number(line.quantity) === Number(item.quantity);
+        });
+      if (!exactRecovery) {
+        throw new Error('Existing supplier cart does not match the claimed Openship items');
       }
-    `, {
-      cartId: cart.id,
-      data: {
-        lineItems: {
-          create: lineItemsToCreate
+    } else {
+      await openFrontClient.request(gql`
+        mutation AddLineItemsToCart($cartId: ID!, $data: CartUpdateInput!) {
+          updateActiveCart(cartId: $cartId, data: $data) { id }
         }
-      }
-    }) as any;
+      `, {
+        cartId: cart.id,
+        data: { lineItems: { create: lineItemsToCreate } },
+      });
+    }
 
-    // Step 4: Create addresses and add to cart
-    const { createAddress: shippingAddr } = await openFrontClient.request(gql`
-      mutation CreateAddress($data: AddressCreateInput!) {
-        createAddress(data: $data) {
-          id
+    // Steps 4-5: create and attach an address only when recovery has not
+    // already reached this point.
+    if (!cart.shippingAddress?.id || !cart.billingAddress?.id) {
+      const { createAddress: shippingAddr } = await openFrontClient.request(gql`
+        mutation CreateAddress($data: AddressCreateInput!) {
+          createAddress(data: $data) { id }
         }
-      }
-    `, {
-      data: {
-        firstName: shipping?.firstName || "Guest",
-        lastName: shipping?.lastName || "Customer", 
-        address1: shipping?.address1 || "123 Default St",
-        city: shipping?.city || "Default City",
-        province: shipping?.state || "NY",
-        postalCode: shipping?.zip || "10001",
-        phone: shipping?.phone || "",
-        country: {
-          connect: {
-            iso2: (shipping?.country || "US").toLowerCase()
-          }
-        }
-      }
-    }) as any;
+      `, {
+        data: {
+          firstName: shipping?.firstName || 'Guest',
+          lastName: shipping?.lastName || 'Customer',
+          address1: shipping?.address1 || '123 Default St',
+          address2: shipping?.address2 || '',
+          city: shipping?.city || 'Default City',
+          province: shipping?.state || shipping?.province || 'NY',
+          postalCode: shipping?.zip || '10001',
+          phone: shipping?.phone || '',
+          country: {
+            connect: { iso2: (shipping?.country || 'US').toLowerCase() },
+          },
+        },
+      }) as any;
 
-    // Step 5: Update cart with addresses
-    await openFrontClient.request(gql`
-      mutation UpdateCartAddresses($cartId: ID!, $data: CartUpdateInput!) {
-        updateActiveCart(cartId: $cartId, data: $data) {
-          id
+      await openFrontClient.request(gql`
+        mutation UpdateCartAddresses($cartId: ID!, $data: CartUpdateInput!) {
+          updateActiveCart(cartId: $cartId, data: $data) { id }
         }
-      }
-    `, {
-      cartId: cart.id,
-      data: {
-        shippingAddress: { connect: { id: shippingAddr.id } },
-        billingAddress: { connect: { id: shippingAddr.id } }
-      }
-    }) as any;
+      `, {
+        cartId: cart.id,
+        data: {
+          shippingAddress: { connect: { id: shippingAddr.id } },
+          billingAddress: { connect: { id: shippingAddr.id } },
+        },
+      });
+    }
 
     // Step 6: Complete cart to create order (like storefront placeOrder)
     const completeResult = await openFrontClient.request(gql`
@@ -469,7 +550,8 @@ export async function createPurchaseFunction({
 
     // Process line items from cart items (since order doesn't include line items)
     const processedLineItems = cartItems.map((item: any) => ({
-      id: item.variantId,
+      id: item.id,
+      cartItemId: item.id,
       title: item.name || `Product ${item.variantId}`,
       quantity: item.quantity,
       variantId: item.variantId,
@@ -480,7 +562,7 @@ export async function createPurchaseFunction({
       purchaseId: order.id,
       orderNumber: `#${order.displayId}`,
       totalPrice: order.total,
-      url: `https://${platform.domain}/account/orders/details/${order.id}`,
+      url: `${platform.domain.replace(/\/$/, '')}/account/orders/details/${order.id}`,
       lineItems: processedLineItems,
       status: "pending",
     };
@@ -505,79 +587,80 @@ export async function createPurchaseFunction({
   }
 }
 
-// Function to create webhook for channel events - simplified to update user's webhook URL
+// Create a durable OpenFront subscription. Customer-token sessions are
+// restricted by OpenFront to USER-scoped fulfillment endpoints; OAuth operator
+// sessions create STORE-scoped endpoints.
 export async function createWebhookFunction({
   platform,
   endpoint,
   events,
+  registrationKey,
 }: {
   platform: OpenFrontPlatform;
   endpoint: string;
   events: string[];
+  registrationKey?: string;
 }) {
-  // Check if ORDER_CANCELLED is requested - OpenFront doesn't support this yet
   if (events.includes('ORDER_CANCELLED')) {
-    throw new Error('OpenFront does not support ORDER_CANCELLED webhooks. Only TRACKING_CREATED webhooks are currently supported.');
+    throw new Error(
+      'OpenFront does not support ORDER_CANCELLED webhooks. Only TRACKING_CREATED webhooks are currently supported.'
+    );
   }
 
-  // Map Openship channel events to OpenFront events
-  const eventMap: Record<string, string> = {
-    ORDER_CREATED: "order.created",
-    TRACKING_CREATED: "fulfillment.created",
-  };
+  const openFrontEvents = openFrontChannelEvents(events);
 
-  const openFrontEvents = events.map(event => eventMap[event] || event);
+  const webhookSecret = platform.webhookSecret;
+  if (!webhookSecret) {
+    throw new Error('OpenFront channel webhook verification secret is not configured');
+  }
 
+  if (!registrationKey) throw new Error('OpenFront channel webhook registration key is required');
   const openFrontClient = await createOpenFrontClient(platform);
-
-  // Get current user from the access token
-  const getUserQuery = gql`
-    query GetCurrentUser {
-      authenticatedItem {
-        ... on User {
-          id
-          email
-          orderWebhookUrl
-        }
-      }
-    }
-  `;
-
-  const { authenticatedItem: user } = await openFrontClient.request(getUserQuery) as any;
-
-  if (!user) {
-    throw new Error('User not authenticated');
-  }
-
-  // Update the user's webhook URL using updateActiveUser (bypasses access restrictions)
-  const updateUserMutation = gql`
-    mutation UpdateActiveUserWebhookUrl($data: UserUpdateProfileInput!) {
-      updateActiveUser(data: $data) {
+  const result = await openFrontClient.request(gql`
+    mutation RegisterChannelWebhook(
+      $registrationKey: String!
+      $url: String!
+      $events: [String!]!
+      $secret: String!
+    ) {
+      registerWebhookEndpoint(
+        registrationKey: $registrationKey
+        url: $url
+        events: $events
+        secret: $secret
+        requiredScope: "USER"
+      ) {
         id
-        orderWebhookUrl
+        url
+        events
+        isActive
+        createdAt
       }
     }
-  `;
-
-  const result = await openFrontClient.request(updateUserMutation, {
-    data: { orderWebhookUrl: endpoint }
+  `, {
+    registrationKey,
+    url: endpoint,
+    events: openFrontEvents,
+    secret: webhookSecret,
   }) as any;
+  const durableWebhook = result.registerWebhookEndpoint;
 
-  const updatedUser = result.updateActiveUser;
+  if (!durableWebhook?.id) {
+    throw new Error('OpenFront did not persist the tracking webhook endpoint');
+  }
 
   return {
     webhooks: [{
-      id: `user-${updatedUser.id}`,
-      callbackUrl: updatedUser.orderWebhookUrl,
-      topic: openFrontEvents.join(", "),
-      format: "JSON",
-      createdAt: new Date().toISOString()
+      id: durableWebhook.id,
+      callbackUrl: durableWebhook.url,
+      topic: openFrontEvents.join(', '),
+      format: 'JSON',
+      createdAt: durableWebhook.createdAt || new Date().toISOString(),
     }],
-    webhookId: `user-${updatedUser.id}`
+    webhookId: durableWebhook.id,
   };
 }
 
-// Function to delete webhook - clear user's webhook URL
 export async function deleteWebhookFunction({
   platform,
   webhookId,
@@ -586,74 +669,59 @@ export async function deleteWebhookFunction({
   webhookId: string;
 }) {
   const openFrontClient = await createOpenFrontClient(platform);
+  if (webhookId.startsWith('user-')) {
+    throw new Error('Legacy user webhook IDs must be replaced by a durable subscription');
+  }
 
-  // Clear the user's webhook URL using updateActiveUser (same as createWebhookFunction)
-  const updateUserMutation = gql`
-    mutation ClearActiveUserWebhookUrl($data: UserUpdateProfileInput!) {
-      updateActiveUser(data: $data) {
-        id
-        orderWebhookUrl
-      }
+  await openFrontClient.request(gql`
+    mutation DeleteChannelWebhook($where: WebhookEndpointWhereUniqueInput!) {
+      deleteWebhookEndpoint(where: $where) { id }
     }
-  `;
+  `, { where: { id: webhookId } });
 
-  const result = await openFrontClient.request(updateUserMutation, {
-    data: { orderWebhookUrl: "" }
-  }) as any;
-
-  const updatedUser = result.updateActiveUser;
-
-  return {
-    success: true,
-    result: updatedUser,
-    deletedWebhookSubscriptionId: webhookId
-  };
+  return { success: true, deletedWebhookSubscriptionId: webhookId };
 }
 
-// Function to get webhooks - get user's webhook URL  
 export async function getWebhooksFunction({
   platform,
 }: {
   platform: OpenFrontPlatform;
 }) {
   const openFrontClient = await createOpenFrontClient(platform);
-
-  // Map OpenFront events back to Openship channel events
-  const eventMap: Record<string, string> = {
-    "order.created": "PURCHASE_CREATED",
-    "fulfillment.created": "PURCHASE_SHIPPED",
-  };
-
-  // Get current user's webhook URL
-  const getUserQuery = gql`
-    query GetCurrentUser {
-      authenticatedItem {
-        ... on User {
-          id
-          email
-          orderWebhookUrl
-          createdAt
-        }
+  const { webhookEndpoints } = await openFrontClient.request(gql`
+    query GetChannelWebhooks {
+      webhookEndpoints(where: { isActive: { equals: true }, scope: { equals: "USER" } }) {
+        id
+        url
+        events
+        createdAt
       }
     }
-  `;
+  `) as any;
 
-  const { authenticatedItem: user } = await openFrontClient.request(getUserQuery) as any;
-  
-  if (!user || !user.orderWebhookUrl) {
-    return { webhooks: [] };
-  }
-
-  // For OpenFront channels, we only support TRACKING_CREATED
-  const webhooks = [{
-    id: `user-${user.id}`,
-    callbackUrl: user.orderWebhookUrl,
-    topic: "TRACKING_CREATED",
-    format: "JSON",
-    createdAt: user.createdAt
-  }];
-
-  return { webhooks };
+  const resourceId = String(platform.resourceId || '').trim();
+  const expectedPath = resourceId
+    ? `/api/handlers/channel/create-tracking/${resourceId}`
+    : null;
+  return {
+    webhooks: (webhookEndpoints || [])
+      .filter((webhook: any) => {
+        if (!webhook.events?.includes('fulfillment.created')) return false;
+        if (!expectedPath) return true;
+        try {
+          return new URL(webhook.url).pathname === expectedPath;
+        } catch {
+          return false;
+        }
+      })
+      .map((webhook: any) => ({
+        id: webhook.id,
+        callbackUrl: webhook.url,
+        topic: 'TRACKING_CREATED',
+        format: 'JSON',
+        createdAt: webhook.createdAt,
+      })),
+  };
 }
 
 // Function to handle purchase tracking updates
@@ -746,28 +814,25 @@ export async function fulfillmentUpdateWebhookHandler({
 export async function oAuthFunction({
   platform,
   callbackUrl,
+  state,
 }: {
   platform: OpenFrontPlatform;
   callbackUrl: string;
+  state: string;
 }) {
   if (!platform.appKey) {
     throw new Error("OpenFront OAuth requires appKey in platform configuration");
   }
-  
-  // Generate OpenFront OAuth URL for channel installation
-  const scopes = "read_products,write_products,read_orders,write_orders,read_fulfillments,write_fulfillments,read_webhooks,write_webhooks";
-  const state = (platform as any).state || Math.random().toString(36).substring(7);
-  
-  // Redirect to apps page with install popup (same as shop integration)
-  const openFrontAuthUrl = `${platform.domain}/dashboard/platform/apps?` +
-    `install=true&` +
-    `client_id=${platform.appKey}&` +
-    `scope=${encodeURIComponent(scopes)}&` +
-    `redirect_uri=${encodeURIComponent(callbackUrl)}&` +
-    `state=${state}&` +
-    `response_type=code`;
-  
-  return { authUrl: openFrontAuthUrl };
+
+  const authUrl = buildOpenFrontOAuthUrl({
+    domain: platform.domain,
+    appKey: platform.appKey,
+    callbackUrl,
+    state,
+    scopes: "read_products,write_products,read_orders,write_orders,read_fulfillments,write_fulfillments,read_webhooks,write_webhooks",
+  });
+
+  return { authUrl };
 }
 
 export async function oAuthCallbackFunction({
@@ -839,12 +904,54 @@ export async function createTrackingWebhookHandler({
   event: any;
   headers: Record<string, string>;
 }) {
-  // Validate event type
+  const signature = headers['x-webhook-signature'] || headers['x-openfront-webhook-signature'];
+  if (!signature) throw new Error('Missing webhook signature');
+  if (!platform.webhookSecret) throw new Error('OpenFront webhook verification secret is not configured');
+
+  const suppliedDigest = signature.replace(/^sha256=/, '');
+  const expectedDigest = crypto
+    .createHmac('sha256', platform.webhookSecret)
+    .update(JSON.stringify(event))
+    .digest('hex');
+  const suppliedBuffer = Buffer.from(suppliedDigest, 'hex');
+  const expectedBuffer = Buffer.from(expectedDigest, 'hex');
+  if (
+    suppliedBuffer.length !== expectedBuffer.length ||
+    !crypto.timingSafeEqual(suppliedBuffer, expectedBuffer)
+  ) {
+    throw new Error('Invalid webhook signature');
+  }
+
+  // Hardened OpenFront outbox payload.
+  if (event.event === 'fulfillment.created') {
+    const data = event.data || {};
+    const purchaseId = data.orderId || data.order?.id;
+    if (!purchaseId) throw new Error('Missing orderId in fulfillment webhook');
+    if (!data.trackingNumber || !data.trackingCompany) {
+      throw new Error('Missing tracking number or carrier in fulfillment webhook');
+    }
+    return {
+      fulfillment: {
+        id: data.id || `fulfillment_${purchaseId}`,
+        orderId: purchaseId,
+        purchaseId,
+        status: 'shipped',
+        trackingCompany: data.trackingCompany,
+        trackingNumber: data.trackingNumber,
+        trackingUrl: data.trackingUrl || null,
+        lineItems: data.lineItems || [],
+        createdAt: event.timestamp || new Date().toISOString(),
+        updatedAt: event.timestamp || new Date().toISOString(),
+      },
+      type: 'fulfillment_created',
+    };
+  }
+
+  // Legacy OpenFront payload retained for existing installations.
   if (event.event !== 'order.fulfilled') {
     throw new Error(`Unsupported event type: ${event.event}`);
   }
 
-  // Extract order and fulfillment data
   const order = event.order;
   const fulfillment = event.fulfillment;
 

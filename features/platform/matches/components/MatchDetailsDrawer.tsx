@@ -87,13 +87,27 @@ export const MatchDetailsDrawer: React.FC<MatchDetailsDrawerProps> = ({
 
     setLoading(true);
     try {
-      // Transform selected items into the format expected by createMatch
-      const shopItemIds = selectedLineItems.map(item => ({ id: item.productId })); // This would need proper shop item creation
-      const channelItemIds = selectedCartItems.map(item => ({ id: item.productId })); // This would need proper channel item creation
-      
+      // Persist the selected remote products as Openship relationship records.
+      // Remote product IDs are not Keystone ShopItem/ChannelItem IDs, so they
+      // must be created rather than connected directly.
       const matchData = {
-        input: { connect: shopItemIds },
-        output: { connect: channelItemIds },
+        input: {
+          create: selectedLineItems.map((item) => ({
+            quantity: item.quantity,
+            productId: item.productId,
+            variantId: item.variantId,
+            shop: { connect: { id: item.shop.id } },
+          })),
+        },
+        output: {
+          create: selectedCartItems.map((item) => ({
+            quantity: item.quantity,
+            productId: item.productId,
+            variantId: item.variantId,
+            price: item.price,
+            channel: { connect: { id: item.channel.id } },
+          })),
+        },
       };
       
       const response = await createMatch(matchData);

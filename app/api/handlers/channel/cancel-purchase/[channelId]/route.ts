@@ -2,123 +2,102 @@ import { NextRequest, NextResponse } from 'next/server';
 import { keystoneContext } from '@/features/keystone/context';
 import { handleChannelCancelWebhook } from '@/features/integrations/channel/lib/executor';
 
+function errorStatus(message: string): number {
+  if (/missing webhook|invalid webhook|hmac|signature/i.test(message)) return 401;
+  if (/channel not found/i.test(message)) return 404;
+  if (/missing purchase|no cart items/i.test(message)) return 400;
+  return 500;
+}
+
 export async function POST(
   request: NextRequest,
   { params }: { params: Promise<{ channelId: string }> }
 ) {
   try {
-    // Respond immediately to acknowledge receipt
-    const response = NextResponse.json({ received: true });
-
-    // Get the webhook payload
     const body = await request.json();
     const headers = Object.fromEntries(request.headers.entries());
     const { channelId } = await params;
-
-    // Process webhook asynchronously
-    processWebhook(channelId, body, headers);
-
-    return response;
+    await processWebhook(channelId, body, headers);
+    return NextResponse.json({ received: true });
   } catch (error) {
+    const message = error instanceof Error ? error.message : 'Webhook processing failed';
     console.error('Error processing cancel purchase webhook:', error);
-    return NextResponse.json({ error: 'Webhook processing failed' }, { status: 500 });
+    return NextResponse.json({ error: message }, { status: errorStatus(message) });
   }
 }
 
-async function processWebhook(channelId: string, body: any, headers: any) {
-  try {
-    // Find the channel and its platform
-    const channel = await keystoneContext.sudo().query.Channel.findOne({
-      where: { id: channelId },
-      query: `
+async function processWebhook(channelId: string, body: unknown, headers: Record<string, string>) {
+  const sudo = keystoneContext.sudo();
+  const channel = await sudo.query.Channel.findOne({
+    where: { id: channelId },
+    query: `
+      id
+      domain
+      accessToken
+      metadata
+      webhookSecret
+      platform {
         id
-        domain
-        accessToken
-        platform {
-          id
-          name
-          cancelPurchaseWebhookHandler
-          appKey
-          appSecret
-        }
-      `,
-    });
+        name
+        cancelPurchaseWebhookHandler
+        appKey
+        appSecret
+        webhookSecret
+      }
+    `,
+  });
+  if (!channel) throw new Error(`Channel not found: ${channelId}`);
 
-    if (!channel) {
-      console.error(`Channel not found: ${channelId}`);
-      return;
-    }
+  const result = await handleChannelCancelWebhook({
+    platform: {
+      ...channel.platform,
+      ...(channel.metadata || {}),
+      webhookSecret: channel.webhookSecret || channel.platform?.webhookSecret,
+      resourceId: channel.id,
+      domain: channel.domain,
+      accessToken: channel.accessToken,
+    },
+    event: body,
+    headers,
+  });
+  const purchaseId = String(
+    result?.purchaseId || result?.order?.id || (typeof result === 'string' ? result : '')
+  ).trim();
+  if (!purchaseId) throw new Error('Cancellation webhook is missing purchaseId');
 
-    console.log('Processing cancel purchase webhook for channel:', channel.domain);
+  const cartItems = await sudo.query.CartItem.findMany({
+    where: {
+      purchaseId: { equals: purchaseId },
+      channel: { id: { equals: channelId } },
+    },
+    query: 'id status order { id }',
+  });
+  if (cartItems.length === 0) {
+    throw new Error(`No cart items found for purchaseId: ${purchaseId}`);
+  }
 
-    // Use the channel provider adapter to handle the webhook
-    const purchaseId = await handleChannelCancelWebhook({
-      platform: {
-        ...channel.platform,
-        domain: channel.domain,
-        accessToken: channel.accessToken,
-      },
-      event: body,
-      headers,
-    });
-
-    console.log('Purchase ID to cancel:', purchaseId);
-
-    // Find all cart items associated with this purchase
-    const cartItems = await keystoneContext.sudo().query.CartItem.findMany({
-      where: { purchaseId: { equals: purchaseId } },
-      query: `
-        id
-        purchaseId
-        title
-        status
-        order {
-          id
-          orderName
-        }
-      `,
-    });
-
-    if (cartItems.length === 0) {
-      console.warn(`No cart items found for purchaseId: ${purchaseId}`);
-      return;
-    }
-
-    // Update all cart items to cancelled status
-    const updatePromises = cartItems.map(item =>
-      keystoneContext.sudo().query.CartItem.updateOne({
+  await Promise.all(
+    cartItems
+      .filter((item: any) => item.status !== 'CANCELLED')
+      .map((item: any) => sudo.query.CartItem.updateOne({
         where: { id: item.id },
         data: { status: 'CANCELLED' },
-        query: 'id status title purchaseId',
-      })
-    );
+        query: 'id',
+      }))
+  );
 
-    const updatedCartItems = await Promise.all(updatePromises);
-
-    console.log('Cart items cancelled successfully:', updatedCartItems);
-
-    // Check if all cart items in the order are now cancelled
-    // If so, we might want to update the order status as well
-    const orderIds = [...new Set(cartItems.map(item => item.order.id))];
-    
-    for (const orderId of orderIds) {
-      const allCartItemsInOrder = await keystoneContext.sudo().query.CartItem.findMany({
-        where: { order: { id: { equals: orderId } } },
-        query: 'id status',
+  const orderIds = [...new Set(cartItems.map((item: any) => item.order?.id).filter(Boolean))];
+  for (const orderId of orderIds) {
+    const remaining = await sudo.query.CartItem.findMany({
+      where: { order: { id: { equals: String(orderId) } } },
+      query: 'id status',
+    });
+    if (remaining.length > 0 && remaining.every((item: any) => item.status === 'CANCELLED')) {
+      await sudo.query.Order.updateOne({
+        where: { id: String(orderId) },
+        data: { status: 'CANCELLED' },
+        query: 'id',
       });
-
-      const allCancelled = allCartItemsInOrder.every(item => item.status === 'CANCELLED');
-      
-      if (allCancelled) {
-        await keystoneContext.sudo().query.Order.updateOne({
-          where: { id: orderId },
-          data: { status: 'CANCELLED' },
-          query: 'id status orderName',
-        });
-        console.log(`Order ${orderId} marked as cancelled`);
-      }
     }
-  } catch (error) {
-    console.error('Error processing cancel purchase webhook:', error);
   }
 }

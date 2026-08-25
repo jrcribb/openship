@@ -19,6 +19,17 @@ import {
 
 
 
+function webhookTopics(webhook: any): string[] {
+  if (Array.isArray(webhook.topic)) return webhook.topic;
+  if (Array.isArray(webhook.topics)) return webhook.topics;
+  return webhook.topic ? [webhook.topic] : [];
+}
+
+function absoluteWebhookUrl(value: string): string {
+  if (typeof window === 'undefined') return value;
+  return new URL(value, window.location.origin).toString();
+}
+
 const WebhookItem = ({ webhook, onRefresh, shopId }: {
   webhook: any;
   onRefresh: () => void;
@@ -63,7 +74,7 @@ const WebhookItem = ({ webhook, onRefresh, shopId }: {
           <div className="rounded-full text-green-400 bg-green-400/20 p-1">
             <div className="h-2 w-2 rounded-full bg-current animate-pulse" />
           </div>
-          <span className="text-sm font-medium">{webhook.topic}</span>
+          <span className="text-sm font-medium">{webhookTopics(webhook).join(', ')}</span>
           <TooltipProvider>
             <Tooltip>
               <TooltipTrigger asChild>
@@ -105,57 +116,33 @@ const RecommendedWebhookItem = ({ webhook, onRefresh, shopId }: {
   const { toast } = useToast();
 
   const handleEnable = async () => {
-    console.log("🔥 [WEBHOOK UI] Button clicked - Starting webhook creation");
-    console.log("🔥 [WEBHOOK UI] shopId:", shopId);
-    console.log("🔥 [WEBHOOK UI] webhook.topic:", webhook.topic);
-    console.log("🔥 [WEBHOOK UI] webhook.callbackUrl:", webhook.callbackUrl);
-    
-    // Get base URL and prepend to relative callback URL
-    const baseUrl = typeof window !== 'undefined' ? window.location.origin : "https://macbook-pro-3.tail272f03.ts.net";
-    const finalEndpoint = `${baseUrl}${webhook.callbackUrl}`;
-    console.log("🔥 [WEBHOOK UI] baseUrl:", baseUrl);
-    console.log("🔥 [WEBHOOK UI] finalEndpoint:", finalEndpoint);
-    
     setLoading(true);
     try {
-      console.log("🔥 [WEBHOOK UI] Calling createShopWebhook with:", {
-        shopId,
-        topic: webhook.topic,
-        endpoint: finalEndpoint
-      });
-      
-      const response = await createShopWebhook(
-        shopId,
-        webhook.topic,
-        finalEndpoint
-      );
-
-      console.log("🔥 [WEBHOOK UI] Response received:", response);
+      if (typeof window === 'undefined') {
+        throw new Error('Webhook setup requires a browser origin');
+      }
+      const finalEndpoint = new URL(webhook.callbackUrl, window.location.origin).toString();
+      const response = await createShopWebhook(shopId, webhook.topic, finalEndpoint);
 
       if (response.success) {
-        console.log("🔥 [WEBHOOK UI] Success! Webhook created with ID:", response.data?.webhookId);
-        toast({
-          title: "Webhook enabled successfully",
-        });
+        toast({ title: 'Webhook enabled successfully' });
         onRefresh();
       } else {
-        console.error("🔥 [WEBHOOK UI] Failed to create webhook:", response.error);
         toast({
-          title: "Failed to enable webhook",
-          description: response.error || "Unknown error",
-          variant: "destructive",
+          title: 'Failed to enable webhook',
+          description: response.error || 'Unknown error',
+          variant: 'destructive',
         });
       }
     } catch (err: any) {
-      console.error("🔥 [WEBHOOK UI] Exception caught:", err);
-      console.error("🔥 [WEBHOOK UI] Exception stack:", err.stack);
       toast({
-        title: "Failed to enable webhook",
+        title: 'Failed to enable webhook',
         description: err.message,
-        variant: "destructive",
+        variant: 'destructive',
       });
+    } finally {
+      setLoading(false);
     }
-    setLoading(false);
   };
 
   return (
@@ -237,7 +224,7 @@ export const Webhooks = ({ shopId, shop }: { shopId: string; shop?: any }) => {
         <div className="space-y-3">
           {webhooks.map((webhook: any) => (
             <WebhookItem
-              key={webhook.id}
+              key={`${webhook.id}-${webhookTopics(webhook).join('-')}`}
               webhook={webhook}
               onRefresh={invalidateShops}
               shopId={shopId}
@@ -249,14 +236,11 @@ export const Webhooks = ({ shopId, shop }: { shopId: string; shop?: any }) => {
       {/* Disabled/Recommended webhooks */}
       <div className="space-y-3">
         {recommendedWebhooks.map((webhook: any) => {
-          const fullRecommendedUrl = (typeof window !== 'undefined' ? window.location.origin : '') + webhook.callbackUrl;
+          const fullRecommendedUrl = absoluteWebhookUrl(webhook.callbackUrl);
 
           const existingWebhook = webhooks.find(
-            (w: any) => {
-              const existingTopic = Array.isArray(w.topic) ? w.topic[0] : w.topic;
-              return existingTopic === webhook.topic &&
-                w.callbackUrl === fullRecommendedUrl;
-            }
+            (w: any) => webhookTopics(w).includes(webhook.topic) &&
+              absoluteWebhookUrl(w.callbackUrl) === fullRecommendedUrl
           );
           
           return !existingWebhook ? (

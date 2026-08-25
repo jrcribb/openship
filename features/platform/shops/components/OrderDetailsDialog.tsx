@@ -43,6 +43,7 @@ interface SelectedLineItem {
   quantity: number;
   productId: string;
   variantId: string;
+  lineItemId?: string;
   shop: {
     id: string;
     name: string;
@@ -211,6 +212,7 @@ export function OrderDetailsDialog({
           quantity: item.quantity || 1,
           productId: item.productId || "",
           variantId: item.variantId || "",
+          lineItemId: item.lineItemId || "",
           shop: {
             id: shopId,
             name: "Shop" // Keep simple to avoid dependency issues
@@ -256,6 +258,7 @@ export function OrderDetailsDialog({
         name: item.title || `Product ${item.productId}`,
         productId: item.productId,
         variantId: item.variantId,
+        lineItemId: item.lineItemId || "",
         price: item.price || "0",
         quantity: item.quantity,
         image: item.image,

@@ -5,11 +5,60 @@ interface AddMatchToCartArgs {
   orderId: string;
 }
 
+export function sourceLineForSavedMatch({
+  match,
+  orderLineItems,
+}: {
+  match: any;
+  orderLineItems: any[];
+}) {
+  if (match.input?.length !== 1) {
+    throw new Error(
+      'Saved multi-line matches cannot safely map supplier items to source lines; save one match per source line'
+    );
+  }
+
+  const input = match.input[0];
+  const candidates = orderLineItems.filter(
+    (line: any) =>
+      line.productId === input.productId &&
+      line.variantId === input.variantId &&
+      Number(line.quantity) === Number(input.quantity) &&
+      String(line.lineItemId || '').trim()
+  );
+
+  if (candidates.length !== 1) {
+    throw new Error('Saved match must resolve to exactly one source order line');
+  }
+
+  return candidates[0];
+}
+
 export async function getMatches({ orderId, context }: { orderId: string; context: KeystoneContext }) {
   async function createCartItems({ matches }: { matches: any[] }) {
     if (matches.length > 0) {
       let result;
       for (const existingMatch of matches) {
+        const sourceLine = sourceLineForSavedMatch({
+          match: existingMatch,
+          orderLineItems: order.lineItems,
+        });
+        const routedItems = [
+          ...(await context.query.CartItem.findMany({
+            where: {
+              order: { id: { equals: order.id } },
+              lineItemId: { equals: String(sourceLine.lineItemId) },
+              status: { not: { equals: 'CANCELLED' } },
+            },
+            query: 'id quantity productId variantId channel { id }',
+          })),
+        ];
+        let allocatedQuantity = routedItems.reduce(
+          (total: number, item: any) => total + Number(item.quantity || 0),
+          0
+        );
+        let matchedQuantity = 0;
+
         for (const {
           channel,
           productId,
@@ -17,37 +66,52 @@ export async function getMatches({ orderId, context }: { orderId: string; contex
           price: matchPrice,
           id,
           user,
+          lineItemId: _savedLineItemId,
           ...rest
         } of existingMatch.output) {
-          // Create platform object with all necessary data
+          const outputQuantity = Number(rest.quantity || 0);
+          matchedQuantity += outputQuantity;
+          if (matchedQuantity > Number(sourceLine.quantity || 0)) {
+            throw new Error('Saved match routes more quantity than the source order line contains');
+          }
+
+          const existingItem = routedItems.find(
+            (item: any) =>
+              item.channel?.id === channel.id &&
+              item.productId === productId &&
+              item.variantId === variantId &&
+              Number(item.quantity) === outputQuantity
+          );
+          if (existingItem) {
+            result = existingItem;
+            continue;
+          }
+          if (allocatedQuantity + outputQuantity > Number(sourceLine.quantity || 0)) {
+            throw new Error('Saved match exceeds the source line quantity already routed');
+          }
+
           const platformData = {
             ...channel.platform,
             domain: channel.domain,
             accessToken: channel.accessToken,
           };
 
-          // Use the new executor pattern to get product data
           const productResult = await executeChannelAdapterFunction({
             platform: platformData,
             functionName: "getProductFunction",
-            args: { productId, variantId },
+            args: { productId, variantId, currency: order.currency },
           });
-          
           const product = productResult.product;
-
-          // Simple string comparison - no parsing needed
           const currentPriceStr = String(product.price || '');
           const savedPriceStr = String(matchPrice || '');
           const hasPriceChange = currentPriceStr !== savedPriceStr;
-          
-          // Store price as text (no parsing needed)
-          const priceValue = currentPriceStr;
 
           result = await context.query.CartItem.createOne({
             data: {
-              price: priceValue,
+              price: currentPriceStr,
               productId,
               variantId,
+              lineItemId: String(sourceLine.lineItemId),
               image: product.image,
               name: product.title,
               order: { connect: { id: order.id } },
@@ -58,6 +122,14 @@ export async function getMatches({ orderId, context }: { orderId: string; contex
               user: { connect: { id: user.id } },
               ...rest,
             },
+          });
+          allocatedQuantity += outputQuantity;
+          routedItems.push({
+            id: result.id,
+            quantity: outputQuantity,
+            productId,
+            variantId,
+            channel: { id: channel.id },
           });
         }
       }
@@ -72,9 +144,10 @@ export async function getMatches({ orderId, context }: { orderId: string; contex
     },
     query: `
     id
+    currency
     user {
       id
-    } 
+    }
     lineItems {
       image
       price

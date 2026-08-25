@@ -30,21 +30,32 @@ interface Product {
   variantId: string;
   price: string;
   quantity?: number;
+  lineItemId?: string;
+}
+
+interface SourceLine {
+  id: string;
+  lineItemId?: string;
+  name: string;
+  quantity?: number;
 }
 
 interface ChannelSearchAccordionProps {
   channels: Channel[];
-  onAddItem: (product: Product, channelId: string, orderId: string) => void;
+  lineItems: SourceLine[];
+  onAddItem: (product: Product, channelId: string, orderId: string) => Promise<unknown> | unknown;
   orderId: string;
 }
 
 export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
   channels,
+  lineItems,
   onAddItem,
   orderId,
 }) => {
   const [searchEntry, setSearchEntry] = useState('');
   const [selectedChannelId, setSelectedChannelId] = useState('');
+  const [selectedSourceLineId, setSelectedSourceLineId] = useState('');
   const [isOpen, setIsOpen] = useState(false);
   const [quantities, setQuantities] = useState<Record<string, number>>({});
   const [searchResults, setSearchResults] = useState<Product[]>([]);
@@ -53,6 +64,8 @@ export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
   const inputId = useId();
   // Track add status for each product: 'idle' | 'loading' | 'success' | 'error'
   const [addStatus, setAddStatus] = useState<Record<string, 'idle' | 'loading' | 'success' | 'error'>>({});
+  const routableLines = (lineItems || []).filter((item) => item.lineItemId);
+  const productKey = (product: Product) => `${product.productId}:${product.variantId}`;
 
   const handleSearch = async () => {
     if (!selectedChannelId || !searchEntry) {
@@ -86,25 +99,48 @@ export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
     }
   };
 
-  const handleQuantityChange = (productId: string, newQuantity: number) => {
-    setQuantities({ ...quantities, [productId]: Math.max(1, newQuantity) });
+  const handleQuantityChange = (key: string, newQuantity: number) => {
+    setQuantities({ ...quantities, [key]: Math.max(1, newQuantity) });
   };
 
   const handleAddItem = async (product: Product) => {
-    const productId = product.productId;
-    setAddStatus((prev) => ({ ...prev, [productId]: 'loading' }));
+    const key = productKey(product);
+    const sourceLineItemId = selectedSourceLineId ||
+      (routableLines.length === 1 ? String(routableLines[0].lineItemId) : '');
+    if (!sourceLineItemId) {
+      toast({
+        title: 'Select a source item',
+        description: 'Choose the ordered line that this supplier item will fulfill.',
+        variant: 'destructive',
+      });
+      return;
+    }
+
+    setAddStatus((prev) => ({ ...prev, [key]: 'loading' }));
     try {
-      const quantity = quantities[productId] || 1;
-      await onAddItem({ ...product, quantity }, selectedChannelId, orderId);
-      setAddStatus((prev) => ({ ...prev, [productId]: 'success' }));
-      setQuantities({ ...quantities, [productId]: 1 });
+      const quantity = quantities[key] || 1;
+      const response: any = await onAddItem(
+        { ...product, quantity, lineItemId: sourceLineItemId },
+        selectedChannelId,
+        orderId
+      );
+      if (response?.success === false) {
+        throw new Error(response.error || 'The item could not be routed.');
+      }
+      setAddStatus((prev) => ({ ...prev, [key]: 'success' }));
+      setQuantities({ ...quantities, [key]: 1 });
       setTimeout(() => {
-        setAddStatus((prev) => ({ ...prev, [productId]: 'idle' }));
+        setAddStatus((prev) => ({ ...prev, [key]: 'idle' }));
       }, 1200);
-    } catch (e) {
-      setAddStatus((prev) => ({ ...prev, [productId]: 'error' }));
+    } catch (error) {
+      toast({
+        title: 'Unable to add supplier item',
+        description: error instanceof Error ? error.message : 'The item could not be routed.',
+        variant: 'destructive',
+      });
+      setAddStatus((prev) => ({ ...prev, [key]: 'error' }));
       setTimeout(() => {
-        setAddStatus((prev) => ({ ...prev, [productId]: 'idle' }));
+        setAddStatus((prev) => ({ ...prev, [key]: 'idle' }));
       }, 1200);
     }
   };
@@ -139,6 +175,20 @@ export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
                 ))}
               </SelectContent>
             </Select>
+            {routableLines.length > 1 && (
+              <Select value={selectedSourceLineId} onValueChange={setSelectedSourceLineId}>
+                <SelectTrigger className="w-fit -ms-px rounded-none shadow-none text-muted-foreground hover:text-foreground">
+                  <SelectValue placeholder="Source item" />
+                </SelectTrigger>
+                <SelectContent>
+                  {routableLines.map((line) => (
+                    <SelectItem key={line.id} value={String(line.lineItemId)}>
+                      {line.name} × {line.quantity || 1}
+                    </SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            )}
             <div className="relative flex-1">
               <Input
                 id={inputId}
@@ -162,9 +212,11 @@ export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
         </div>
         {searchResults.length > 0 ? (
           <div className="space-y-2 mt-2 max-h-60 overflow-y-auto">
-            {searchResults.map((product) => (
+            {searchResults.map((product) => {
+              const key = productKey(product);
+              return (
               <div
-                key={`${product.productId}-${product.variantId}`}
+                key={key}
                 className="flex items-center space-x-2 p-2 bg-background rounded-md border"
               >
                 <div className="w-12 h-12 flex-shrink-0 rounded-md overflow-hidden">
@@ -197,21 +249,21 @@ export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
                       variant="outline"
                       size="icon"
                       className="h-6 w-6"
-                      onClick={() => handleQuantityChange(product.productId, (quantities[product.productId] || 1) - 1)}
+                      onClick={() => handleQuantityChange(key, (quantities[key] || 1) - 1)}
                     >
                       <ChevronLeft className="h-3 w-3" />
                     </Button>
                     <Input
                       className="mx-1 border rounded-md h-6 w-10 text-center bg-background"
                       type="text"
-                      value={quantities[product.productId] || 1}
-                      onChange={(e) => handleQuantityChange(product.productId, parseInt(e.target.value, 10))}
+                      value={quantities[key] || 1}
+                      onChange={(e) => handleQuantityChange(key, parseInt(e.target.value, 10))}
                     />
                     <Button
                       variant="outline"
                       size="icon"
                       className="h-6 w-6"
-                      onClick={() => handleQuantityChange(product.productId, (quantities[product.productId] || 1) + 1)}
+                      onClick={() => handleQuantityChange(key, (quantities[key] || 1) + 1)}
                     >
                       <ChevronRight className="h-3 w-3" />
                     </Button>
@@ -221,13 +273,13 @@ export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
                     size="icon"
                     className="h-6 w-6"
                     onClick={() => handleAddItem(product)}
-                    disabled={addStatus[product.productId] === 'loading'}
+                    disabled={addStatus[key] === 'loading'}
                   >
-                    {addStatus[product.productId] === 'loading' ? (
+                    {addStatus[key] === 'loading' ? (
                       <Loader2 className="h-3 w-3 animate-spin" />
-                    ) : addStatus[product.productId] === 'success' ? (
+                    ) : addStatus[key] === 'success' ? (
                       <Check className="h-3 w-3 text-green-600" />
-                    ) : addStatus[product.productId] === 'error' ? (
+                    ) : addStatus[key] === 'error' ? (
                       <X className="h-3 w-3 text-red-600" />
                     ) : (
                       <Plus className="h-3 w-3" />
@@ -235,7 +287,8 @@ export const ChannelSearchAccordion: React.FC<ChannelSearchAccordionProps> = ({
                   </Button>
                 </div>
               </div>
-            ))}
+              );
+            })}
           </div>
         ) : !loading && (
           <div className="text-center text-muted-foreground py-4">

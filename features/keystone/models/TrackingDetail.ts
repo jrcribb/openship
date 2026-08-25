@@ -1,9 +1,10 @@
 import { list } from "@keystone-6/core";
 import { allOperations } from "@keystone-6/core/access";
-import { relationship, text, timestamp } from "@keystone-6/core/fields";
+import { json, relationship, text, timestamp } from "@keystone-6/core/fields";
 
 import { isSignedIn, permissions, rules } from "../access";
 import { trackingFields } from "./trackingFields";
+import { relaySourceTrackingForDetail } from "../../integrations/channel/tracking-relay";
 
 export const TrackingDetail = list({
   access: {
@@ -34,98 +35,9 @@ export const TrackingDetail = list({
     },
     afterOperation: async ({ operation, item, context }) => {
       if (operation === "create") {
-        const sudoContext = context.sudo();
-        
-        // Get tracking detail with related data
-        const foundTracking = await sudoContext.query.TrackingDetail.findOne({
-          where: { id: String(item.id) },
-          query: `
-            id
-            trackingNumber
-            trackingCompany
-            purchaseId
-            cartItems {
-              id
-              purchaseId
-              order {
-                id
-                orderName
-                orderId
-                status
-                shop {
-                  id
-                  domain
-                  accessToken
-                  platform {
-                    id
-                    name
-                    addTrackingFunction
-                  }
-                }
-              }
-            }
-          `,
-        });
-        
-        if (!foundTracking?.cartItems?.length) {
-          return;
-        }
-        
-        const firstCartItem = foundTracking.cartItems[0];
-        const order = firstCartItem.order;
-        
-        // Execute shop platform addTracking function
-        if (order.shop?.platform?.addTrackingFunction) {
-          try {
-            // Use the executor pattern
-            const { addShopTracking } = await import('../../integrations/shop/lib/executor');
-            
-            await addShopTracking({
-              platform: {
-                ...order.shop.platform,
-                domain: order.shop.domain,
-                accessToken: order.shop.accessToken,
-              },
-              order: order,
-              trackingCompany: foundTracking.trackingCompany,
-              trackingNumber: foundTracking.trackingNumber,
-            });
-          } catch (error) {
-            console.error('Error calling addTracking:', error);
-            // Don't throw - continue with order status update even if shop tracking fails
-          }
-        }
-        
-        // Check if all cart items for this order have tracking
-        const foundOrder = await sudoContext.query.Order.findOne({
-          where: { id: order.id },
-          query: `
-            id
-            orderName
-            status
-            cartItems(
-              where: {
-                AND: [
-                  { trackingDetails: { none: {} } },
-                  { status: { not: { equals: "CANCELLED" } } }
-                ]
-              }
-            ) {
-              id
-              status
-            }
-          `,
-        });
-        
-        // If no untracked items remain, update order status to COMPLETE
-        if (foundOrder && foundOrder.cartItems.length === 0 && foundOrder.status === "AWAITING") {
-          await sudoContext.query.Order.updateOne({
-            where: { id: foundOrder.id },
-            data: {
-              status: "COMPLETE",
-            },
-          });
-        }
+        // Propagate relay failures so the inbound webhook remains retryable.
+        // The TrackingDetail row itself is the durable pending state.
+        await relaySourceTrackingForDetail(context, String(item.id));
       }
     },
   },
@@ -143,6 +55,21 @@ export const TrackingDetail = list({
       validation: { isRequired: true },
     }),
     purchaseId: text(),
+    dedupeKey: text({
+      isIndexed: "unique",
+      db: { isNullable: true },
+      ui: {
+        itemView: { fieldMode: "read" },
+        createView: { fieldMode: "hidden" },
+      },
+    }),
+    fulfillmentLineItems: json({
+      defaultValue: [],
+      ui: { itemView: { fieldMode: "read" } },
+    }),
+    relayedAt: timestamp({
+      ui: { itemView: { fieldMode: "read" } },
+    }),
 
     // Relationships
     cartItems: relationship({

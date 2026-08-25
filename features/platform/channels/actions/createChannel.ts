@@ -10,10 +10,7 @@ export interface CreateChannelInput {
   accessToken: string;
   refreshToken?: string;
   tokenExpiresAt?: Date;
-  platformId?: string; // Optional for marketplace flow
-  platform?: { // For inline platform creation
-    create: any;
-  };
+  platformId: string;
 }
 
 export async function createChannel(data: CreateChannelInput) {
@@ -31,18 +28,6 @@ export async function createChannel(data: CreateChannelInput) {
     }
   `;
 
-  // Handle platform connection (existing) vs creation (inline)
-  let platformData;
-  if (data.platformId) {
-    // Existing platform - connect by ID
-    platformData = { connect: { id: data.platformId } };
-  } else if (data.platform?.create) {
-    // Inline platform creation
-    platformData = { create: data.platform.create };
-  } else {
-    throw new Error('Either platformId or platform.create must be provided');
-  }
-
   const variables = {
     data: {
       name: data.name,
@@ -50,7 +35,7 @@ export async function createChannel(data: CreateChannelInput) {
       accessToken: data.accessToken,
       ...(data.refreshToken && { refreshToken: data.refreshToken }),
       ...(data.tokenExpiresAt && { tokenExpiresAt: data.tokenExpiresAt.toISOString() }),
-      platform: platformData
+      platform: { connect: { id: data.platformId } }
     }
   };
 

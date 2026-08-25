@@ -100,7 +100,7 @@ interface OrderDetailsComponentProps {
   loadingActions?: Record<string, Record<string, boolean>>;
   removeEditItemButton?: boolean;
   renderButtons?: () => React.ReactNode;
-  onAction: (action: string, orderId: string, data?: any) => void;
+  onAction: (action: string, orderId: string, data?: any) => Promise<unknown> | unknown;
   isSelected: boolean;
   onSelectItem: (itemId: string, checked: boolean) => void;
 }
@@ -143,7 +143,7 @@ export const OrderDetailsComponent = ({
   };
 
   const handleAddToCart = async (product: any, channelId: string, orderId: string) => {
-    onAction('addToCart', orderId, { ...product, name: product.title, channelId });
+    return onAction('addToCart', orderId, { ...product, name: product.title, channelId });
   };
 
   const handleMatchOrder = async () => {
@@ -371,6 +371,12 @@ export const OrderDetailsComponent = ({
               />
               <ChannelSearchAccordion
                 channels={channels}
+                lineItems={(order.lineItems || []).map((item) => ({
+                  id: item.id,
+                  lineItemId: item.lineItemId,
+                  name: item.name,
+                  quantity: item.quantity,
+                }))}
                 onAddItem={handleAddToCart}
                 orderId={order.id}
               />

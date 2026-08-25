@@ -57,7 +57,6 @@ export function PlatformSelect({
               id
               name
               appKey
-              appSecret
               oAuthFunction
               oAuthCallbackFunction
             }
@@ -73,7 +72,6 @@ export function PlatformSelect({
         });
 
         const result = await response.json();
-        console.log('PlatformSelect fetch result:', result);
 
         if (result.errors) {
           setError(result.errors[0].message);
@@ -82,7 +80,6 @@ export function PlatformSelect({
 
         if (result.data?.shopPlatforms) {
           setPlatforms(result.data.shopPlatforms);
-          console.log('PlatformSelect platforms loaded:', result.data.shopPlatforms);
         } else {
           setError('No platforms found');
         }
@@ -131,14 +128,11 @@ export function PlatformSelect({
           <SelectValue placeholder="Select a platform" />
         </SelectTrigger>
         <SelectContent>
-          {platforms.map((platform) => {
-            console.log('Rendering platform:', platform);
-            return (
-              <SelectItem key={platform.id} value={platform.id}>
-                {platform.name}
-              </SelectItem>
-            );
-          })}
+          {platforms.map((platform) => (
+            <SelectItem key={platform.id} value={platform.id}>
+              {platform.name}
+            </SelectItem>
+          ))}
         </SelectContent>
       </Select>
     </div>

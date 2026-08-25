@@ -154,6 +154,7 @@ export const Order = list({
               await placeMultipleOrders({
                 ids: [item.id],
                 query: sudoContext.query,
+                prisma: sudoContext.prisma,
               });
             }
           } else {
@@ -188,6 +189,7 @@ export const Order = list({
                   const processedOrder = await placeMultipleOrders({
                     ids: [item.id],
                     query: sudoContext.query,
+                    prisma: sudoContext.prisma,
                   });
                 }
               }
@@ -208,6 +210,7 @@ export const Order = list({
           const processedOrder = await placeMultipleOrders({
             ids: [item.id],
             query: sudoContext.query,
+            prisma: sudoContext.prisma,
           });
         }
       }
@@ -221,7 +224,7 @@ export const Order = list({
   fields: {
     // Order identifiers
     orderId: text({
-      isIndexed: "unique",
+      isIndexed: true,
       validation: { isRequired: true },
     }),
     orderName: text(),
@@ -290,5 +293,11 @@ export const Order = list({
     }),
 
     ...trackingFields,
+  },
+  db: {
+    extendPrismaSchema: (schema) => schema.replace(
+      /(model [^}]+)}/g,
+      "$1@@unique([shopId, orderId])\n}"
+    ),
   },
 });

@@ -26,6 +26,19 @@ export const ChannelPlatform = list({
       fields: {
         appKey: text(),
         appSecret: text(),
+        webhookSecret: text({
+          db: { isNullable: true },
+          access: {
+            read: () => false,
+            create: () => false,
+            update: () => false,
+          },
+          ui: {
+            createView: { fieldMode: "hidden" },
+            itemView: { fieldMode: "hidden" },
+            listView: { fieldMode: "hidden" },
+          },
+        }),
         callbackUrl: virtual({
           field: graphql.field({
             type: graphql.String,

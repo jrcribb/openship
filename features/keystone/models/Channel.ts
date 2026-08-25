@@ -5,7 +5,6 @@ import { graphql } from "@keystone-6/core";
 
 import { isSignedIn, permissions, rules } from "../access";
 import { trackingFields } from "./trackingFields";
-import { getBaseUrl } from '../../dashboard/lib/getBaseUrl';
 import { executeChannelAdapterFunction } from '../utils/channelProviderAdapter';
 
 export const Channel = list({
@@ -50,6 +49,10 @@ export const Channel = list({
     }),
     metadata: json({
       defaultValue: {},
+    }),
+    webhookSecret: text({
+      access: { read: () => false, create: () => false, update: () => false },
+      ui: { itemView: { fieldMode: "hidden" } },
     }),
 
     // Relationships
@@ -106,8 +109,15 @@ export const Channel = list({
             // Get platform data with relationships resolved
             const channelWithPlatform = await context.query.Channel.findOne({
               where: { id: String(item.id) },
-              query: 'platform { getWebhooksFunction }'
+              query: 'platform { getWebhooksFunction createWebhookFunction }'
             });
+
+            if (channelWithPlatform?.platform?.createWebhookFunction === 'openfront') {
+              const unsupportedIndex = recommendedWebhooks.findIndex(
+                (webhook) => webhook.topic === 'ORDER_CANCELLED'
+              );
+              if (unsupportedIndex >= 0) recommendedWebhooks.splice(unsupportedIndex, 1);
+            }
 
             if (!channelWithPlatform?.platform?.getWebhooksFunction) {
               return {
@@ -118,10 +128,11 @@ export const Channel = list({
             }
 
             const platformConfig: any = {
+              ...(item.metadata || {}),
+              resourceId: String(item.id),
               domain: item.domain,
               accessToken: item.accessToken,
               getWebhooksFunction: channelWithPlatform.platform.getWebhooksFunction,
-              ...(item.metadata || {}),
             };
 
             const webhooksResult = await executeChannelAdapterFunction({

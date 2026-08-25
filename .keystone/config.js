@@ -35,6 +35,36 @@ var __toESM = (mod, isNodeMode, target) => (target = mod != null ? __create(__ge
 ));
 var __toCommonJS = (mod) => __copyProps(__defProp({}, "__esModule", { value: true }), mod);
 
+// features/integrations/openfront-webhook-topics.ts
+function mapSingleTopic(events, mapping, kind) {
+  if (events.length !== 1 || !mapping[events[0]]) {
+    throw new Error(`OpenFront does not support ${kind} webhook topic: ${events.join(", ")}`);
+  }
+  return [mapping[events[0]]];
+}
+function openFrontShopEvents(events) {
+  return mapSingleTopic(events, SHOP_TOPICS, "shop");
+}
+function openFrontChannelEvents(events) {
+  return mapSingleTopic(events, CHANNEL_TOPICS, "channel");
+}
+var SHOP_TOPICS, CHANNEL_TOPICS, OPENFRONT_SHOP_TOPIC_BY_EVENT;
+var init_openfront_webhook_topics = __esm({
+  "features/integrations/openfront-webhook-topics.ts"() {
+    "use strict";
+    SHOP_TOPICS = {
+      ORDER_CREATED: "order.created",
+      ORDER_CANCELLED: "order.canceled"
+    };
+    CHANNEL_TOPICS = {
+      TRACKING_CREATED: "fulfillment.created"
+    };
+    OPENFRONT_SHOP_TOPIC_BY_EVENT = Object.fromEntries(
+      Object.entries(SHOP_TOPICS).map(([topic, event]) => [event, topic])
+    );
+  }
+});
+
 // features/integrations/channel/openfront.ts
 var openfront_exports = {};
 __export(openfront_exports, {
@@ -207,7 +237,8 @@ async function getProductFunction({
 async function createPurchaseFunction({
   platform,
   cartItems,
-  shipping
+  shipping,
+  idempotencyKey
 }) {
   const openFrontClient = await createOpenFrontClient(platform);
   try {
@@ -231,81 +262,136 @@ async function createPurchaseFunction({
     if (!region) {
       throw new Error(`No region found for currency: ${currencyCode}`);
     }
-    const { createCart: cart } = await openFrontClient.request(import_graphql_request.gql`
-      mutation CreateCart($data: CartCreateInput!) {
-        createCart(data: $data) {
-          id
-          region {
+    const findExistingCart = async () => {
+      if (!idempotencyKey) return null;
+      const result = await openFrontClient.request(import_graphql_request.gql`
+        query FindSupplierCart($idempotencyKey: String!) {
+          carts(
+            where: { idempotencyKey: { equals: $idempotencyKey } }
+            take: 1
+          ) {
             id
-            currency {
+            region { id currency { id code } }
+            lineItems {
               id
-              code
+              quantity
+              metadata
+              productVariant { id }
             }
+            shippingAddress { id }
+            billingAddress { id }
+            order { id displayId total status }
           }
         }
+      `, { idempotencyKey });
+      return result.carts?.[0] || null;
+    };
+    let cart = await findExistingCart();
+    if (cart?.order?.id) {
+      return {
+        purchaseId: cart.order.id,
+        orderNumber: `#${cart.order.displayId}`,
+        totalPrice: cart.order.total,
+        url: `${platform.domain.replace(/\/$/, "")}/account/orders/details/${cart.order.id}`,
+        lineItems: cartItems.map((item) => ({
+          id: item.id,
+          title: item.name || `Product ${item.variantId}`,
+          quantity: item.quantity,
+          variantId: item.variantId
+        })),
+        status: cart.order.status || "pending",
+        reconciled: true
+      };
+    }
+    if (!cart) {
+      try {
+        const result = await openFrontClient.request(import_graphql_request.gql`
+          mutation CreateCart($data: CartCreateInput!) {
+            createCart(data: $data) {
+              id
+              region { id currency { id code } }
+            }
+          }
+        `, {
+          data: {
+            region: { connect: { id: region.id } },
+            email: shipping?.email || `order-${Date.now()}@openship.generated`,
+            ...idempotencyKey ? { idempotencyKey } : {}
+          }
+        });
+        cart = { ...result.createCart, lineItems: [] };
+      } catch (error) {
+        cart = await findExistingCart();
+        if (!cart) throw error;
       }
-    `, {
-      data: {
-        region: { connect: { id: region.id } },
-        email: shipping?.email || `order-${Date.now()}@openship.generated`
-      }
-    });
+    }
     const lineItemsToCreate = [];
     for (const item of cartItems) {
       lineItemsToCreate.push({
         productVariant: { connect: { id: item.variantId } },
-        quantity: item.quantity
+        quantity: item.quantity,
+        metadata: {
+          openshipCartItemId: item.id,
+          openshipSourceLineItemId: item.lineItemId || null
+        }
       });
     }
-    await openFrontClient.request(import_graphql_request.gql`
-      mutation AddLineItemsToCart($cartId: ID!, $data: CartUpdateInput!) {
-        updateActiveCart(cartId: $cartId, data: $data) {
-          id
-        }
+    if (cart.lineItems?.length) {
+      const existingByCartItem = new Map(
+        cart.lineItems.map((line) => [
+          String(line.metadata?.openshipCartItemId || ""),
+          line
+        ])
+      );
+      const exactRecovery = cart.lineItems.length === cartItems.length && cartItems.every((item) => {
+        const line = existingByCartItem.get(String(item.id));
+        return line && line.productVariant?.id === item.variantId && Number(line.quantity) === Number(item.quantity);
+      });
+      if (!exactRecovery) {
+        throw new Error("Existing supplier cart does not match the claimed Openship items");
       }
-    `, {
-      cartId: cart.id,
-      data: {
-        lineItems: {
-          create: lineItemsToCreate
+    } else {
+      await openFrontClient.request(import_graphql_request.gql`
+        mutation AddLineItemsToCart($cartId: ID!, $data: CartUpdateInput!) {
+          updateActiveCart(cartId: $cartId, data: $data) { id }
         }
-      }
-    });
-    const { createAddress: shippingAddr } = await openFrontClient.request(import_graphql_request.gql`
-      mutation CreateAddress($data: AddressCreateInput!) {
-        createAddress(data: $data) {
-          id
+      `, {
+        cartId: cart.id,
+        data: { lineItems: { create: lineItemsToCreate } }
+      });
+    }
+    if (!cart.shippingAddress?.id || !cart.billingAddress?.id) {
+      const { createAddress: shippingAddr } = await openFrontClient.request(import_graphql_request.gql`
+        mutation CreateAddress($data: AddressCreateInput!) {
+          createAddress(data: $data) { id }
         }
-      }
-    `, {
-      data: {
-        firstName: shipping?.firstName || "Guest",
-        lastName: shipping?.lastName || "Customer",
-        address1: shipping?.address1 || "123 Default St",
-        city: shipping?.city || "Default City",
-        province: shipping?.state || "NY",
-        postalCode: shipping?.zip || "10001",
-        phone: shipping?.phone || "",
-        country: {
-          connect: {
-            iso2: (shipping?.country || "US").toLowerCase()
+      `, {
+        data: {
+          firstName: shipping?.firstName || "Guest",
+          lastName: shipping?.lastName || "Customer",
+          address1: shipping?.address1 || "123 Default St",
+          address2: shipping?.address2 || "",
+          city: shipping?.city || "Default City",
+          province: shipping?.state || shipping?.province || "NY",
+          postalCode: shipping?.zip || "10001",
+          phone: shipping?.phone || "",
+          country: {
+            connect: { iso2: (shipping?.country || "US").toLowerCase() }
           }
         }
-      }
-    });
-    await openFrontClient.request(import_graphql_request.gql`
-      mutation UpdateCartAddresses($cartId: ID!, $data: CartUpdateInput!) {
-        updateActiveCart(cartId: $cartId, data: $data) {
-          id
+      });
+      await openFrontClient.request(import_graphql_request.gql`
+        mutation UpdateCartAddresses($cartId: ID!, $data: CartUpdateInput!) {
+          updateActiveCart(cartId: $cartId, data: $data) { id }
         }
-      }
-    `, {
-      cartId: cart.id,
-      data: {
-        shippingAddress: { connect: { id: shippingAddr.id } },
-        billingAddress: { connect: { id: shippingAddr.id } }
-      }
-    });
+      `, {
+        cartId: cart.id,
+        data: {
+          shippingAddress: { connect: { id: shippingAddr.id } },
+          billingAddress: { connect: { id: shippingAddr.id } }
+        }
+      });
+    }
     const completeResult = await openFrontClient.request(import_graphql_request.gql`
       mutation CompleteActiveCart($cartId: ID!) {
         completeActiveCart(cartId: $cartId)
@@ -318,7 +404,8 @@ async function createPurchaseFunction({
       throw new Error("Failed to complete cart - no order created");
     }
     const processedLineItems = cartItems.map((item) => ({
-      id: item.variantId,
+      id: item.id,
+      cartItemId: item.id,
       title: item.name || `Product ${item.variantId}`,
       quantity: item.quantity,
       variantId: item.variantId
@@ -327,7 +414,7 @@ async function createPurchaseFunction({
       purchaseId: order.id,
       orderNumber: `#${order.displayId}`,
       totalPrice: order.total,
-      url: `https://${platform.domain}/account/orders/details/${order.id}`,
+      url: `${platform.domain.replace(/\/$/, "")}/account/orders/details/${order.id}`,
       lineItems: processedLineItems,
       status: "pending"
     };
@@ -352,53 +439,61 @@ async function createPurchaseFunction({
 async function createWebhookFunction({
   platform,
   endpoint,
-  events
+  events,
+  registrationKey
 }) {
   if (events.includes("ORDER_CANCELLED")) {
-    throw new Error("OpenFront does not support ORDER_CANCELLED webhooks. Only TRACKING_CREATED webhooks are currently supported.");
+    throw new Error(
+      "OpenFront does not support ORDER_CANCELLED webhooks. Only TRACKING_CREATED webhooks are currently supported."
+    );
   }
-  const eventMap = {
-    ORDER_CREATED: "order.created",
-    TRACKING_CREATED: "fulfillment.created"
-  };
-  const openFrontEvents = events.map((event) => eventMap[event] || event);
+  const openFrontEvents = openFrontChannelEvents(events);
+  const webhookSecret = platform.webhookSecret;
+  if (!webhookSecret) {
+    throw new Error("OpenFront channel webhook verification secret is not configured");
+  }
+  if (!registrationKey) throw new Error("OpenFront channel webhook registration key is required");
   const openFrontClient = await createOpenFrontClient(platform);
-  const getUserQuery = import_graphql_request.gql`
-    query GetCurrentUser {
-      authenticatedItem {
-        ... on User {
-          id
-          email
-          orderWebhookUrl
-        }
-      }
-    }
-  `;
-  const { authenticatedItem: user } = await openFrontClient.request(getUserQuery);
-  if (!user) {
-    throw new Error("User not authenticated");
-  }
-  const updateUserMutation = import_graphql_request.gql`
-    mutation UpdateActiveUserWebhookUrl($data: UserUpdateProfileInput!) {
-      updateActiveUser(data: $data) {
+  const result = await openFrontClient.request(import_graphql_request.gql`
+    mutation RegisterChannelWebhook(
+      $registrationKey: String!
+      $url: String!
+      $events: [String!]!
+      $secret: String!
+    ) {
+      registerWebhookEndpoint(
+        registrationKey: $registrationKey
+        url: $url
+        events: $events
+        secret: $secret
+        requiredScope: "USER"
+      ) {
         id
-        orderWebhookUrl
+        url
+        events
+        isActive
+        createdAt
       }
     }
-  `;
-  const result = await openFrontClient.request(updateUserMutation, {
-    data: { orderWebhookUrl: endpoint }
+  `, {
+    registrationKey,
+    url: endpoint,
+    events: openFrontEvents,
+    secret: webhookSecret
   });
-  const updatedUser = result.updateActiveUser;
+  const durableWebhook = result.registerWebhookEndpoint;
+  if (!durableWebhook?.id) {
+    throw new Error("OpenFront did not persist the tracking webhook endpoint");
+  }
   return {
     webhooks: [{
-      id: `user-${updatedUser.id}`,
-      callbackUrl: updatedUser.orderWebhookUrl,
+      id: durableWebhook.id,
+      callbackUrl: durableWebhook.url,
       topic: openFrontEvents.join(", "),
       format: "JSON",
-      createdAt: (/* @__PURE__ */ new Date()).toISOString()
+      createdAt: durableWebhook.createdAt || (/* @__PURE__ */ new Date()).toISOString()
     }],
-    webhookId: `user-${updatedUser.id}`
+    webhookId: durableWebhook.id
   };
 }
 async function deleteWebhookFunction({
@@ -406,56 +501,49 @@ async function deleteWebhookFunction({
   webhookId
 }) {
   const openFrontClient = await createOpenFrontClient(platform);
-  const updateUserMutation = import_graphql_request.gql`
-    mutation ClearActiveUserWebhookUrl($data: UserUpdateProfileInput!) {
-      updateActiveUser(data: $data) {
-        id
-        orderWebhookUrl
-      }
+  if (webhookId.startsWith("user-")) {
+    throw new Error("Legacy user webhook IDs must be replaced by a durable subscription");
+  }
+  await openFrontClient.request(import_graphql_request.gql`
+    mutation DeleteChannelWebhook($where: WebhookEndpointWhereUniqueInput!) {
+      deleteWebhookEndpoint(where: $where) { id }
     }
-  `;
-  const result = await openFrontClient.request(updateUserMutation, {
-    data: { orderWebhookUrl: "" }
-  });
-  const updatedUser = result.updateActiveUser;
-  return {
-    success: true,
-    result: updatedUser,
-    deletedWebhookSubscriptionId: webhookId
-  };
+  `, { where: { id: webhookId } });
+  return { success: true, deletedWebhookSubscriptionId: webhookId };
 }
 async function getWebhooksFunction({
   platform
 }) {
   const openFrontClient = await createOpenFrontClient(platform);
-  const eventMap = {
-    "order.created": "PURCHASE_CREATED",
-    "fulfillment.created": "PURCHASE_SHIPPED"
-  };
-  const getUserQuery = import_graphql_request.gql`
-    query GetCurrentUser {
-      authenticatedItem {
-        ... on User {
-          id
-          email
-          orderWebhookUrl
-          createdAt
-        }
+  const { webhookEndpoints } = await openFrontClient.request(import_graphql_request.gql`
+    query GetChannelWebhooks {
+      webhookEndpoints(where: { isActive: { equals: true }, scope: { equals: "USER" } }) {
+        id
+        url
+        events
+        createdAt
       }
     }
-  `;
-  const { authenticatedItem: user } = await openFrontClient.request(getUserQuery);
-  if (!user || !user.orderWebhookUrl) {
-    return { webhooks: [] };
-  }
-  const webhooks = [{
-    id: `user-${user.id}`,
-    callbackUrl: user.orderWebhookUrl,
-    topic: "TRACKING_CREATED",
-    format: "JSON",
-    createdAt: user.createdAt
-  }];
-  return { webhooks };
+  `);
+  const resourceId = String(platform.resourceId || "").trim();
+  const expectedPath = resourceId ? `/api/handlers/channel/create-tracking/${resourceId}` : null;
+  return {
+    webhooks: (webhookEndpoints || []).filter((webhook) => {
+      if (!webhook.events?.includes("fulfillment.created")) return false;
+      if (!expectedPath) return true;
+      try {
+        return new URL(webhook.url).pathname === expectedPath;
+      } catch {
+        return false;
+      }
+    }).map((webhook) => ({
+      id: webhook.id,
+      callbackUrl: webhook.url,
+      topic: "TRACKING_CREATED",
+      format: "JSON",
+      createdAt: webhook.createdAt
+    }))
+  };
 }
 async function addTrackingFunction({
   platform,
@@ -576,6 +664,39 @@ async function createTrackingWebhookHandler({
   event,
   headers
 }) {
+  const signature = headers["x-webhook-signature"] || headers["x-openfront-webhook-signature"];
+  if (!signature) throw new Error("Missing webhook signature");
+  if (!platform.webhookSecret) throw new Error("OpenFront webhook verification secret is not configured");
+  const suppliedDigest = signature.replace(/^sha256=/, "");
+  const expectedDigest = import_crypto.default.createHmac("sha256", platform.webhookSecret).update(JSON.stringify(event)).digest("hex");
+  const suppliedBuffer = Buffer.from(suppliedDigest, "hex");
+  const expectedBuffer = Buffer.from(expectedDigest, "hex");
+  if (suppliedBuffer.length !== expectedBuffer.length || !import_crypto.default.timingSafeEqual(suppliedBuffer, expectedBuffer)) {
+    throw new Error("Invalid webhook signature");
+  }
+  if (event.event === "fulfillment.created") {
+    const data = event.data || {};
+    const purchaseId = data.orderId || data.order?.id;
+    if (!purchaseId) throw new Error("Missing orderId in fulfillment webhook");
+    if (!data.trackingNumber || !data.trackingCompany) {
+      throw new Error("Missing tracking number or carrier in fulfillment webhook");
+    }
+    return {
+      fulfillment: {
+        id: data.id || `fulfillment_${purchaseId}`,
+        orderId: purchaseId,
+        purchaseId,
+        status: "shipped",
+        trackingCompany: data.trackingCompany,
+        trackingNumber: data.trackingNumber,
+        trackingUrl: data.trackingUrl || null,
+        lineItems: data.lineItems || [],
+        createdAt: event.timestamp || (/* @__PURE__ */ new Date()).toISOString(),
+        updatedAt: event.timestamp || (/* @__PURE__ */ new Date()).toISOString()
+      },
+      type: "fulfillment_created"
+    };
+  }
   if (event.event !== "order.fulfilled") {
     throw new Error(`Unsupported event type: ${event.event}`);
   }
@@ -617,12 +738,14 @@ async function createTrackingWebhookHandler({
 function scopes() {
   return REQUIRED_SCOPES;
 }
-var import_graphql_request, import_context, getFreshAccessToken, createOpenFrontClient, getProductImageUrl, REQUIRED_SCOPES;
+var import_crypto, import_graphql_request, import_context, getFreshAccessToken, createOpenFrontClient, getProductImageUrl, REQUIRED_SCOPES;
 var init_openfront = __esm({
   "features/integrations/channel/openfront.ts"() {
     "use strict";
+    import_crypto = __toESM(require("crypto"));
     import_graphql_request = require("graphql-request");
     import_context = require("@/features/keystone/context");
+    init_openfront_webhook_topics();
     getFreshAccessToken = async (platform) => {
       const channels = await import_context.keystoneContext.sudo().query.Channel.findMany({
         where: {
@@ -1038,9 +1161,15 @@ async function createWebhookFunction2({
         format: "JSON"
       }
     });
+    if (result.webhookSubscriptionCreate.userErrors.length > 0) {
+      throw new Error(result.webhookSubscriptionCreate.userErrors[0].message);
+    }
     webhooks.push(result.webhookSubscriptionCreate.webhookSubscription);
   }
-  return { webhooks };
+  return {
+    webhooks,
+    webhookId: webhooks[0]?.id?.split("/").pop()
+  };
 }
 async function deleteWebhookFunction2({
   platform,
@@ -1221,135 +1350,61 @@ var init_shopify = __esm({
   }
 });
 
-// import("../**/*.ts") in features/integrations/channel/lib/executor.ts
-var globImport_ts;
-var init_ = __esm({
-  'import("../**/*.ts") in features/integrations/channel/lib/executor.ts'() {
-    globImport_ts = __glob({
-      "../lib/executor.ts": () => Promise.resolve().then(() => (init_executor(), executor_exports)),
-      "../openfront.ts": () => Promise.resolve().then(() => (init_openfront(), openfront_exports)),
-      "../shopify.ts": () => Promise.resolve().then(() => (init_shopify(), shopify_exports))
-    });
+// features/integrations/shop/openfront-order-search.ts
+var openfront_order_search_exports = {};
+__export(openfront_order_search_exports, {
+  openFrontOrderSearchWhere: () => openFrontOrderSearchWhere
+});
+function openFrontOrderSearchWhere(searchEntry) {
+  const normalizedSearch = searchEntry?.trim();
+  if (!normalizedSearch) return {};
+  const displayId = Number(normalizedSearch.replace(/^#/, ""));
+  return {
+    OR: [
+      ...Number.isSafeInteger(displayId) && displayId >= 0 ? [{ displayId: { equals: displayId } }] : [],
+      { email: { contains: normalizedSearch, mode: "insensitive" } },
+      {
+        shippingAddress: {
+          OR: [
+            { firstName: { contains: normalizedSearch, mode: "insensitive" } },
+            { lastName: { contains: normalizedSearch, mode: "insensitive" } }
+          ]
+        }
+      }
+    ]
+  };
+}
+var init_openfront_order_search = __esm({
+  "features/integrations/shop/openfront-order-search.ts"() {
+    "use strict";
   }
 });
 
-// features/integrations/channel/lib/executor.ts
-var executor_exports = {};
-__export(executor_exports, {
-  createChannelPurchase: () => createChannelPurchase,
-  createChannelWebhook: () => createChannelWebhook,
-  deleteChannelWebhook: () => deleteChannelWebhook,
-  executeChannelAdapterFunction: () => executeChannelAdapterFunction,
-  getChannelProduct: () => getChannelProduct,
-  getChannelWebhooks: () => getChannelWebhooks,
-  handleChannelCancelWebhook: () => handleChannelCancelWebhook,
-  handleChannelOAuth: () => handleChannelOAuth,
-  handleChannelOAuthCallback: () => handleChannelOAuthCallback,
-  handleChannelTrackingWebhook: () => handleChannelTrackingWebhook,
-  searchChannelProducts: () => searchChannelProducts
+// features/integrations/shop/openfront-webhook-security.ts
+var openfront_webhook_security_exports = {};
+__export(openfront_webhook_security_exports, {
+  deriveOpenFrontShopWebhookSecret: () => deriveOpenFrontShopWebhookSecret,
+  verifyOpenFrontShopWebhook: () => verifyOpenFrontShopWebhook
 });
-async function executeChannelAdapterFunction({ platform, functionName, args }) {
-  const functionPath = platform[functionName];
-  if (functionPath.startsWith("http")) {
-    const response = await fetch(functionPath, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ platform, ...args })
-    });
-    if (!response.ok) {
-      throw new Error(`HTTP request failed: ${response.statusText}`);
-    }
-    return response.json();
-  }
-  const adapter = await globImport_ts(`../${functionPath}.ts`);
-  const fn = adapter[functionName];
-  if (!fn) {
-    throw new Error(
-      `Function ${functionName} not found in adapter ${functionPath}`
-    );
-  }
-  try {
-    return await fn({ platform, ...args });
-  } catch (error) {
-    throw new Error(
-      `Error executing ${functionName} for platform ${functionPath}: ${error.message}`
-    );
-  }
+function deriveOpenFrontShopWebhookSecret(appSecret) {
+  if (!appSecret) throw new Error("OpenFront shop webhook app secret is not configured");
+  return import_node_crypto.default.createHmac("sha256", appSecret).update(SHOP_WEBHOOK_SECRET_PURPOSE).digest("hex");
 }
-async function searchChannelProducts({ platform, searchEntry, after }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "searchProductsFunction",
-    args: { searchEntry, after }
-  });
+function verifyOpenFrontShopWebhook(event, signature, appSecret, webhookSecret) {
+  const secret = webhookSecret || (appSecret ? deriveOpenFrontShopWebhookSecret(appSecret) : "");
+  if (!signature || !secret) return false;
+  const suppliedHex = signature.replace(/^sha256=/i, "");
+  if (!/^[a-f0-9]{64}$/i.test(suppliedHex)) return false;
+  const expected = import_node_crypto.default.createHmac("sha256", secret).update(JSON.stringify(event)).digest();
+  const supplied = Buffer.from(suppliedHex, "hex");
+  return supplied.length === expected.length && import_node_crypto.default.timingSafeEqual(supplied, expected);
 }
-async function getChannelProduct({ platform, productId }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "getProductFunction",
-    args: { productId }
-  });
-}
-async function createChannelPurchase({ platform, cartItems, shipping, notes }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "createPurchaseFunction",
-    args: { cartItems, shipping, notes }
-  });
-}
-async function createChannelWebhook({ platform, endpoint, events }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "createWebhookFunction",
-    args: { endpoint, events }
-  });
-}
-async function deleteChannelWebhook({ platform, webhookId }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "deleteWebhookFunction",
-    args: { webhookId }
-  });
-}
-async function getChannelWebhooks({ platform }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "getWebhooksFunction",
-    args: {}
-  });
-}
-async function handleChannelOAuth({ platform, callbackUrl, state }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "oAuthFunction",
-    args: { callbackUrl, state }
-  });
-}
-async function handleChannelOAuthCallback({ platform, code, shop, state, appKey, appSecret, redirectUri }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "oAuthCallbackFunction",
-    args: { code, shop, state, appKey, appSecret, redirectUri }
-  });
-}
-async function handleChannelTrackingWebhook({ platform, event, headers }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "createTrackingWebhookHandler",
-    args: { event, headers }
-  });
-}
-async function handleChannelCancelWebhook({ platform, event, headers }) {
-  return executeChannelAdapterFunction({
-    platform,
-    functionName: "cancelPurchaseWebhookHandler",
-    args: { event, headers }
-  });
-}
-var init_executor = __esm({
-  "features/integrations/channel/lib/executor.ts"() {
+var import_node_crypto, SHOP_WEBHOOK_SECRET_PURPOSE;
+var init_openfront_webhook_security = __esm({
+  "features/integrations/shop/openfront-webhook-security.ts"() {
     "use strict";
-    init_();
+    import_node_crypto = __toESM(require("node:crypto"));
+    SHOP_WEBHOOK_SECRET_PURPOSE = "openship:openfront:shop-webhook:v1";
   }
 });
 
@@ -1629,21 +1684,7 @@ async function searchOrdersFunction({
       ordersCount(where: $where)
     }
   `;
-  const where = {};
-  if (searchEntry && searchEntry.trim()) {
-    where.OR = [
-      { displayId: { contains: searchEntry, mode: "insensitive" } },
-      { email: { contains: searchEntry, mode: "insensitive" } },
-      { shippingAddress: {
-        is: {
-          OR: [
-            { firstName: { contains: searchEntry, mode: "insensitive" } },
-            { lastName: { contains: searchEntry, mode: "insensitive" } }
-          ]
-        }
-      } }
-    ];
-  }
+  const where = openFrontOrderSearchWhere(searchEntry);
   const take = 15;
   const skip = after ? parseInt(Buffer.from(after, "base64").toString()) : 0;
   const { orders, ordersCount } = await openFrontClient.request(gqlQuery, {
@@ -1656,7 +1697,7 @@ async function searchOrdersFunction({
     return {
       orderId: order.id,
       orderName: `#${order.displayId}`,
-      link: `${platform.domain}/admin/orders/${order.id}`,
+      link: `${platform.domain}/dashboard/platform/orders/${order.id}`,
       date: new Date(order.createdAt).toLocaleDateString(),
       firstName: shippingAddress.firstName || "",
       lastName: shippingAddress.lastName || "",
@@ -1735,34 +1776,43 @@ async function updateProductFunction({
 async function createWebhookFunction3({
   platform,
   endpoint,
-  events
+  events,
+  registrationKey
 }) {
   const openFrontClient = await createOpenFrontClient2(platform);
-  const createWebhookMutation = import_graphql_request3.gql`
-    mutation CreateWebhookEndpoint($data: WebhookEndpointCreateInput!) {
-      createWebhookEndpoint(data: $data) {
+  const openFrontEvents = openFrontShopEvents(events);
+  if (!registrationKey) throw new Error("OpenFront shop webhook registration key is required");
+  const webhookSecret = platform.webhookSecret || deriveOpenFrontShopWebhookSecret(platform.appSecret || "");
+  const result = await openFrontClient.request(import_graphql_request3.gql`
+    mutation RegisterShopWebhook(
+      $registrationKey: String!
+      $url: String!
+      $events: [String!]!
+      $secret: String!
+    ) {
+      registerWebhookEndpoint(
+        registrationKey: $registrationKey
+        url: $url
+        events: $events
+        secret: $secret
+        requiredScope: "STORE"
+      ) {
         id
         url
         events
         isActive
-        secret
       }
     }
-  `;
-  const eventMap = {
-    ORDER_CREATED: "order.created",
-    ORDER_CANCELLED: "order.cancelled",
-    TRACKING_CREATED: "fulfillment.created"
-  };
-  const openFrontEvents = events.map((event) => eventMap[event] || event);
-  const result = await openFrontClient.request(createWebhookMutation, {
-    data: {
-      url: endpoint,
-      events: openFrontEvents,
-      isActive: true
-    }
+  `, {
+    registrationKey,
+    url: endpoint,
+    events: openFrontEvents,
+    secret: webhookSecret
   });
-  const webhook = result.createWebhookEndpoint;
+  const webhook = result.registerWebhookEndpoint;
+  if (!webhook?.id) {
+    throw new Error("OpenFront did not persist the shop webhook endpoint");
+  }
   return {
     webhooks: [webhook],
     webhookId: webhook.id
@@ -1791,7 +1841,7 @@ async function getWebhooksFunction3({
   const openFrontClient = await createOpenFrontClient2(platform);
   const query = import_graphql_request3.gql`
     query GetWebhookEndpoints {
-      webhookEndpoints(where: { isActive: { equals: true } }) {
+      webhookEndpoints(where: { isActive: { equals: true }, scope: { equals: "STORE" } }) {
         id
         url
         events
@@ -1801,19 +1851,27 @@ async function getWebhooksFunction3({
     }
   `;
   const { webhookEndpoints } = await openFrontClient.request(query);
-  const baseUrl = await (0, import_getBaseUrl.getBaseUrl)();
-  const eventMap = {
-    "order.created": "ORDER_CREATED",
-    "order.cancelled": "ORDER_CANCELLED",
-    "fulfillment.created": "TRACKING_CREATED"
-  };
-  const webhooks = webhookEndpoints.map((webhook) => ({
-    id: webhook.id,
-    callbackUrl: webhook.url.replace(baseUrl, ""),
-    topic: webhook.events.map((event) => eventMap[event] || event),
-    format: "JSON",
-    createdAt: webhook.createdAt
-  }));
+  const resourceId = String(platform.resourceId || "").trim();
+  const webhooks = webhookEndpoints.flatMap((webhook) => {
+    let pathname = "";
+    try {
+      pathname = new URL(webhook.url).pathname;
+    } catch {
+      return [];
+    }
+    const allowedPaths = resourceId ? /* @__PURE__ */ new Set([
+      `/api/handlers/shop/create-order/${resourceId}`,
+      `/api/handlers/shop/cancel-order/${resourceId}`
+    ]) : null;
+    if (allowedPaths && !allowedPaths.has(pathname)) return [];
+    return (webhook.events || []).filter((event) => Boolean(OPENFRONT_SHOP_TOPIC_BY_EVENT[event])).map((event) => ({
+      id: webhook.id,
+      callbackUrl: webhook.url,
+      topic: OPENFRONT_SHOP_TOPIC_BY_EVENT[event],
+      format: "JSON",
+      createdAt: webhook.createdAt
+    }));
+  });
   return { webhooks };
 }
 async function oAuthFunction3({
@@ -1874,8 +1932,8 @@ async function createOrderWebhookHandler({
   headers
 }) {
   const signature = headers["x-openfront-webhook-signature"] || headers["X-OpenFront-Webhook-Signature"];
-  if (!signature) {
-    throw new Error("Missing webhook signature");
+  if (!verifyOpenFrontShopWebhook(event, signature, platform.appSecret, platform.webhookSecret)) {
+    throw new Error("Invalid OpenFront shop webhook signature");
   }
   const lineItemsOutput = event.data?.lineItems?.map((item) => {
     const productTitle = item.productVariant?.product?.title || "";
@@ -1929,18 +1987,13 @@ async function cancelOrderWebhookHandler({
   event,
   headers
 }) {
-  const signature = headers["x-openfront-webhook-signature"];
-  if (!signature) {
-    throw new Error("Missing webhook signature");
+  const signature = headers["x-openfront-webhook-signature"] || headers["X-OpenFront-Webhook-Signature"];
+  if (!verifyOpenFrontShopWebhook(event, signature, platform.appSecret, platform.webhookSecret)) {
+    throw new Error("Invalid OpenFront shop webhook signature");
   }
-  const orderData = event.data;
-  const order = {
-    id: orderData.id,
-    name: orderData.orderNumber,
-    cancelReason: orderData.cancellationReason || "merchant_cancelled",
-    cancelledAt: (/* @__PURE__ */ new Date()).toISOString()
-  };
-  return { order, type: "order_cancelled" };
+  const orderId = event.data?.id;
+  if (!orderId) throw new Error("Missing order ID in cancellation webhook");
+  return String(orderId);
 }
 function scopes3() {
   return REQUIRED_SCOPES3;
@@ -1949,23 +2002,10 @@ async function addTrackingFunction2({
   platform,
   order,
   trackingCompany,
-  trackingNumber
+  trackingNumber,
+  lineItems
 }) {
   const openFrontClient = await createOpenFrontClient2(platform);
-  const getTrackingUrl = (carrier, trackingNumber2) => {
-    switch (carrier?.toLowerCase()) {
-      case "ups":
-        return `https://www.ups.com/track?tracknum=${trackingNumber2}`;
-      case "usps":
-        return `https://tools.usps.com/go/TrackConfirmAction?tLabels=${trackingNumber2}`;
-      case "fedex":
-        return `https://www.fedex.com/fedextrack/?trknbr=${trackingNumber2}`;
-      case "dhl":
-        return `https://www.dhl.com/en/express/tracking.html?AWB=${trackingNumber2}`;
-      default:
-        return "";
-    }
-  };
   const getOrderQuery = import_graphql_request3.gql`
     query GetOrderForFulfillment($orderId: ID!) {
       order(where: { id: $orderId }) {
@@ -1985,8 +2025,21 @@ async function addTrackingFunction2({
     throw new Error(`Order ${order.orderId} not found or has no line items`);
   }
   const createFulfillmentMutation = import_graphql_request3.gql`
-    mutation CreateFulfillment($data: FulfillmentCreateInput!) {
-      createFulfillment(data: $data) {
+    mutation CreateOrderFulfillment(
+      $orderId: ID!
+      $lineItems: [LineItemInput!]!
+      $trackingNumber: String
+      $carrier: String
+      $idempotencyKey: String!
+    ) {
+      createOrderFulfillment(
+        orderId: $orderId
+        lineItems: $lineItems
+        trackingNumber: $trackingNumber
+        carrier: $carrier
+        noNotification: false
+        idempotencyKey: $idempotencyKey
+      ) {
         id
         shippingLabels {
           id
@@ -1998,52 +2051,37 @@ async function addTrackingFunction2({
         fulfillmentItems {
           id
           quantity
-          lineItem {
-            id
-            title
-          }
+          lineItem { id }
         }
       }
     }
   `;
-  const fulfillmentData = {
-    order: { connect: { id: order.orderId } },
-    fulfillmentProvider: { connect: { code: "fp_manual" } },
-    fulfillmentItems: {
-      create: orderData.lineItems.map((lineItem) => ({
-        lineItem: { connect: { id: lineItem.id } },
-        quantity: lineItem.quantity
-      }))
-    },
-    shippingLabels: {
-      create: [{
-        status: "purchased",
-        carrier: trackingCompany,
-        trackingNumber,
-        trackingUrl: getTrackingUrl(trackingCompany, trackingNumber),
-        metadata: {
-          source: "openship"
-        }
-      }]
-    },
-    noNotification: false,
-    metadata: {
-      source: "openship",
-      createdBy: "openship_integration"
+  const sourceLines = new Map(
+    orderData.lineItems.map((lineItem) => [String(lineItem.id), Number(lineItem.quantity)])
+  );
+  for (const item of lineItems) {
+    const sourceQuantity = sourceLines.get(item.lineItemId);
+    if (!Number.isInteger(item.quantity) || item.quantity <= 0 || sourceQuantity === void 0 || item.quantity > sourceQuantity) {
+      throw new Error(`Invalid source fulfillment quantity for line ${item.lineItemId}`);
     }
-  };
-  const result = await openFrontClient.request(createFulfillmentMutation, {
-    data: fulfillmentData
+  }
+  return openFrontClient.request(createFulfillmentMutation, {
+    orderId: order.orderId,
+    lineItems,
+    trackingNumber,
+    carrier: trackingCompany,
+    idempotencyKey: `openship-tracking:${order.orderId}:${trackingCompany}:${trackingNumber}`
   });
-  return result;
 }
-var import_graphql_request3, import_getBaseUrl, import_context2, getFreshAccessToken2, createOpenFrontClient2, getProductImageUrl2, REQUIRED_SCOPES3;
+var import_graphql_request3, import_context2, getFreshAccessToken2, createOpenFrontClient2, getProductImageUrl2, REQUIRED_SCOPES3;
 var init_openfront2 = __esm({
   "features/integrations/shop/openfront.ts"() {
     "use strict";
     import_graphql_request3 = require("graphql-request");
-    import_getBaseUrl = require("@/features/dashboard/lib/getBaseUrl");
     import_context2 = require("@/features/keystone/context");
+    init_openfront_webhook_security();
+    init_openfront_order_search();
+    init_openfront_webhook_topics();
     getFreshAccessToken2 = async (platform) => {
       const shops = await import_context2.keystoneContext.sudo().query.Shop.findMany({
         where: {
@@ -2639,10 +2677,9 @@ async function getWebhooksFunction4({
     }
   `;
   const { webhookSubscriptions } = await shopifyClient.request(query);
-  const baseUrl = await (0, import_getBaseUrl2.getBaseUrl)();
   const webhooks = webhookSubscriptions.edges.map(({ node }) => ({
     id: node.id.split("/").pop(),
-    callbackUrl: node.endpoint.callbackUrl.replace(baseUrl, ""),
+    callbackUrl: node.endpoint.callbackUrl,
     topic: mapTopic[node.topic] || node.topic,
     format: node.format,
     createdAt: node.createdAt
@@ -2904,22 +2941,23 @@ async function cancelOrderWebhookHandler2({
 function scopes4() {
   return REQUIRED_SCOPES4;
 }
-var import_graphql_request4, import_getBaseUrl2, REQUIRED_SCOPES4;
+var import_graphql_request4, REQUIRED_SCOPES4;
 var init_shopify2 = __esm({
   "features/integrations/shop/shopify.ts"() {
     "use strict";
     import_graphql_request4 = require("graphql-request");
-    import_getBaseUrl2 = require("@/features/dashboard/lib/getBaseUrl");
     REQUIRED_SCOPES4 = "read_products,write_products,read_orders,write_orders,read_inventory,write_inventory";
   }
 });
 
 // import("../**/*.ts") in features/integrations/shop/lib/executor.ts
-var globImport_ts2;
-var init_2 = __esm({
+var globImport_ts;
+var init_ = __esm({
   'import("../**/*.ts") in features/integrations/shop/lib/executor.ts'() {
-    globImport_ts2 = __glob({
-      "../lib/executor.ts": () => Promise.resolve().then(() => (init_executor2(), executor_exports2)),
+    globImport_ts = __glob({
+      "../lib/executor.ts": () => Promise.resolve().then(() => (init_executor(), executor_exports)),
+      "../openfront-order-search.ts": () => Promise.resolve().then(() => (init_openfront_order_search(), openfront_order_search_exports)),
+      "../openfront-webhook-security.ts": () => Promise.resolve().then(() => (init_openfront_webhook_security(), openfront_webhook_security_exports)),
       "../openfront.ts": () => Promise.resolve().then(() => (init_openfront2(), openfront_exports2)),
       "../shopify.ts": () => Promise.resolve().then(() => (init_shopify2(), shopify_exports2))
     });
@@ -2927,8 +2965,8 @@ var init_2 = __esm({
 });
 
 // features/integrations/shop/lib/executor.ts
-var executor_exports2 = {};
-__export(executor_exports2, {
+var executor_exports = {};
+__export(executor_exports, {
   addCartToPlatformOrder: () => addCartToPlatformOrder,
   addShopTracking: () => addShopTracking,
   createShopWebhook: () => createShopWebhook,
@@ -2957,7 +2995,7 @@ async function executeShopAdapterFunction({ platform, functionName, args }) {
     }
     return response.json();
   }
-  const adapter = await globImport_ts2(`../${functionPath}.ts`);
+  const adapter = await globImport_ts(`../${functionPath}.ts`);
   const fn = adapter[functionName];
   if (!fn) {
     throw new Error(
@@ -3007,11 +3045,11 @@ async function addCartToPlatformOrder({ platform, cartItems, orderId }) {
     args: { cartItems, orderId }
   });
 }
-async function createShopWebhook({ platform, endpoint, events }) {
+async function createShopWebhook({ platform, endpoint, events, registrationKey }) {
   return executeShopAdapterFunction({
     platform,
     functionName: "createWebhookFunction",
-    args: { endpoint, events }
+    args: { endpoint, events, registrationKey }
   });
 }
 async function deleteShopWebhook({ platform, webhookId }) {
@@ -3056,15 +3094,323 @@ async function handleShopCancelWebhook({ platform, event, headers }) {
     args: { event, headers }
   });
 }
-async function addShopTracking({ platform, order, trackingCompany, trackingNumber }) {
+async function addShopTracking({ platform, order, trackingCompany, trackingNumber, lineItems }) {
   return executeShopAdapterFunction({
     platform,
     functionName: "addTrackingFunction",
-    args: { order, trackingCompany, trackingNumber }
+    args: { order, trackingCompany, trackingNumber, lineItems }
+  });
+}
+var init_executor = __esm({
+  "features/integrations/shop/lib/executor.ts"() {
+    "use strict";
+    init_();
+  }
+});
+
+// features/integrations/channel/tracking-relay.ts
+var tracking_relay_exports = {};
+__export(tracking_relay_exports, {
+  relaySourceTrackingForDetail: () => relaySourceTrackingForDetail
+});
+async function relaySourceTrackingForDetail(context, trackingDetailId, addTracking) {
+  const sudoContext = context.sudo();
+  const seed = await sudoContext.query.TrackingDetail.findOne({
+    where: { id: trackingDetailId },
+    query: `
+      id trackingNumber trackingCompany fulfillmentLineItems relayedAt
+      cartItems { id quantity lineItemId productId variantId order { id } }
+    `
+  });
+  if (!seed) throw new Error("Tracking detail not found");
+  const orderIds = new Set(
+    (seed.cartItems || []).map((item) => item.order?.id).filter(Boolean)
+  );
+  if (orderIds.size !== 1) {
+    throw new Error("Tracking detail must belong to exactly one source order");
+  }
+  const orderId = [...orderIds][0];
+  const order = await sudoContext.query.Order.findOne({
+    where: { id: orderId },
+    query: `
+      id orderId orderName status
+      shop {
+        id domain accessToken
+        platform { id name addTrackingFunction }
+      }
+      lineItems { id lineItemId productId variantId }
+      cartItems {
+        id status quantity
+        trackingDetails { id fulfillmentLineItems relayedAt }
+      }
+    `
+  });
+  if (!order) throw new Error("Source order not found");
+  const allocationByCartItem = new Map(
+    (Array.isArray(seed.fulfillmentLineItems) ? seed.fulfillmentLineItems : []).map(
+      (allocation) => [String(allocation.cartItemId), Number(allocation.quantity)]
+    )
+  );
+  const lineItems = [];
+  for (const item of seed.cartItems || []) {
+    const trackingQuantity = allocationByCartItem.size ? allocationByCartItem.get(String(item.id)) : Number(item.quantity);
+    if (!Number.isInteger(trackingQuantity) || Number(trackingQuantity) <= 0) {
+      throw new Error(`Cart item ${item.id} has an invalid tracking quantity`);
+    }
+    let sourceLineItemId = String(item.lineItemId || "").trim();
+    if (!sourceLineItemId) {
+      const matches = (order.lineItems || []).filter(
+        (line) => line.productId === item.productId && line.variantId === item.variantId
+      );
+      if (matches.length !== 1 || !matches[0].lineItemId) {
+        throw new Error(`Cart item ${item.id} cannot be mapped to a source order line`);
+      }
+      sourceLineItemId = String(matches[0].lineItemId);
+      await sudoContext.query.CartItem.updateOne({
+        where: { id: item.id },
+        data: { lineItemId: sourceLineItemId },
+        query: "id"
+      });
+    }
+    lineItems.push({ lineItemId: sourceLineItemId, quantity: Number(trackingQuantity) });
+  }
+  if (!lineItems.length) throw new Error("Tracking detail has no source order lines");
+  if (!order?.shop?.platform?.addTrackingFunction) {
+    throw new Error("Source shop tracking relay is not configured");
+  }
+  const relay = addTracking || (await Promise.resolve().then(() => (init_executor(), executor_exports))).addShopTracking;
+  await relay({
+    platform: {
+      ...order.shop.platform,
+      domain: order.shop.domain,
+      accessToken: order.shop.accessToken
+    },
+    order,
+    trackingCompany: seed.trackingCompany,
+    trackingNumber: seed.trackingNumber,
+    lineItems
+  });
+  await sudoContext.query.TrackingDetail.updateOne({
+    where: { id: seed.id },
+    data: { relayedAt: (/* @__PURE__ */ new Date()).toISOString() },
+    query: "id"
+  });
+  const completedCartItemIds = /* @__PURE__ */ new Set();
+  for (const item of order.cartItems || []) {
+    if (item.status === "CANCELLED") continue;
+    let relayedQuantity = 0;
+    for (const detail of item.trackingDetails || []) {
+      const isCurrent = detail.id === seed.id;
+      if (!detail.relayedAt && !isCurrent) continue;
+      const allocations = Array.isArray(detail.fulfillmentLineItems) ? detail.fulfillmentLineItems : [];
+      if (!allocations.length) {
+        relayedQuantity += Number(item.quantity || 0);
+        continue;
+      }
+      relayedQuantity += allocations.filter((allocation) => String(allocation.cartItemId) === String(item.id)).reduce((sum, allocation) => sum + Number(allocation.quantity || 0), 0);
+    }
+    if (relayedQuantity >= Number(item.quantity || 0)) {
+      completedCartItemIds.add(String(item.id));
+      await sudoContext.query.CartItem.updateOne({
+        where: { id: item.id },
+        data: { status: "COMPLETE", error: "" },
+        query: "id"
+      });
+    }
+  }
+  const activeCartItems = (order.cartItems || []).filter(
+    (item) => item.status !== "CANCELLED"
+  );
+  if (activeCartItems.length > 0 && activeCartItems.every((item) => completedCartItemIds.has(String(item.id)))) {
+    await sudoContext.query.Order.updateOne({
+      where: { id: order.id },
+      data: { status: "COMPLETE", error: "" },
+      query: "id"
+    });
+  }
+}
+var init_tracking_relay = __esm({
+  "features/integrations/channel/tracking-relay.ts"() {
+    "use strict";
+  }
+});
+
+// features/integrations/channel/tracking-webhook.ts
+var tracking_webhook_exports = {};
+__export(tracking_webhook_exports, {
+  supplierCartItemAllocations: () => supplierCartItemAllocations,
+  supplierCartItemIds: () => supplierCartItemIds,
+  trackingDedupeKey: () => trackingDedupeKey
+});
+function trackingDedupeKey(channelId, purchaseId, trackingNumber, fulfillmentId) {
+  const eventIdentity = String(fulfillmentId || trackingNumber).trim().toUpperCase();
+  return import_node_crypto2.default.createHash("sha256").update(`${channelId}\0${purchaseId}\0${eventIdentity}`).digest("hex");
+}
+function supplierCartItemAllocations(lineItems) {
+  if (!Array.isArray(lineItems)) return [];
+  const allocations = /* @__PURE__ */ new Map();
+  for (const item of lineItems) {
+    const cartItemId = String(
+      Array.isArray(item) ? item[2]?.cartItemId || item[2]?.openshipCartItemId || "" : item?.cartItemId || item?.metadata?.openshipCartItemId || item?.lineItem?.metadata?.openshipCartItemId || ""
+    ).trim();
+    const quantity = Number(Array.isArray(item) ? item[1] : item?.quantity);
+    if (!cartItemId) continue;
+    if (!Number.isInteger(quantity) || quantity <= 0) {
+      throw new Error(`Supplier fulfillment has an invalid quantity for cart item ${cartItemId}`);
+    }
+    allocations.set(cartItemId, (allocations.get(cartItemId) || 0) + quantity);
+  }
+  return [...allocations].map(([cartItemId, quantity]) => ({ cartItemId, quantity }));
+}
+function supplierCartItemIds(lineItems) {
+  if (!Array.isArray(lineItems)) return [];
+  return [
+    ...new Set(
+      lineItems.map(
+        (item) => String(
+          Array.isArray(item) ? item[2]?.cartItemId || item[2]?.openshipCartItemId || "" : item?.cartItemId || item?.metadata?.openshipCartItemId || item?.lineItem?.metadata?.openshipCartItemId || ""
+        ).trim()
+      ).filter(Boolean)
+    )
+  ];
+}
+var import_node_crypto2;
+var init_tracking_webhook = __esm({
+  "features/integrations/channel/tracking-webhook.ts"() {
+    "use strict";
+    import_node_crypto2 = __toESM(require("node:crypto"));
+  }
+});
+
+// import("../**/*.ts") in features/integrations/channel/lib/executor.ts
+var globImport_ts2;
+var init_2 = __esm({
+  'import("../**/*.ts") in features/integrations/channel/lib/executor.ts'() {
+    globImport_ts2 = __glob({
+      "../lib/executor.ts": () => Promise.resolve().then(() => (init_executor2(), executor_exports2)),
+      "../openfront.ts": () => Promise.resolve().then(() => (init_openfront(), openfront_exports)),
+      "../shopify.ts": () => Promise.resolve().then(() => (init_shopify(), shopify_exports)),
+      "../tracking-relay.ts": () => Promise.resolve().then(() => (init_tracking_relay(), tracking_relay_exports)),
+      "../tracking-webhook.ts": () => Promise.resolve().then(() => (init_tracking_webhook(), tracking_webhook_exports))
+    });
+  }
+});
+
+// features/integrations/channel/lib/executor.ts
+var executor_exports2 = {};
+__export(executor_exports2, {
+  createChannelPurchase: () => createChannelPurchase,
+  createChannelWebhook: () => createChannelWebhook,
+  deleteChannelWebhook: () => deleteChannelWebhook,
+  executeChannelAdapterFunction: () => executeChannelAdapterFunction,
+  getChannelProduct: () => getChannelProduct,
+  getChannelWebhooks: () => getChannelWebhooks,
+  handleChannelCancelWebhook: () => handleChannelCancelWebhook,
+  handleChannelOAuth: () => handleChannelOAuth,
+  handleChannelOAuthCallback: () => handleChannelOAuthCallback,
+  handleChannelTrackingWebhook: () => handleChannelTrackingWebhook,
+  searchChannelProducts: () => searchChannelProducts
+});
+async function executeChannelAdapterFunction({ platform, functionName, args }) {
+  const functionPath = platform[functionName];
+  if (functionPath.startsWith("http")) {
+    const response = await fetch(functionPath, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ platform, ...args })
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP request failed: ${response.statusText}`);
+    }
+    return response.json();
+  }
+  const adapter = await globImport_ts2(`../${functionPath}.ts`);
+  const fn = adapter[functionName];
+  if (!fn) {
+    throw new Error(
+      `Function ${functionName} not found in adapter ${functionPath}`
+    );
+  }
+  try {
+    return await fn({ platform, ...args });
+  } catch (error) {
+    throw new Error(
+      `Error executing ${functionName} for platform ${functionPath}: ${error.message}`
+    );
+  }
+}
+async function searchChannelProducts({ platform, searchEntry, after }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "searchProductsFunction",
+    args: { searchEntry, after }
+  });
+}
+async function getChannelProduct({ platform, productId }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "getProductFunction",
+    args: { productId }
+  });
+}
+async function createChannelPurchase({ platform, cartItems, shipping, notes, idempotencyKey }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "createPurchaseFunction",
+    args: { cartItems, shipping, notes, idempotencyKey }
+  });
+}
+async function createChannelWebhook({ platform, endpoint, events, registrationKey }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "createWebhookFunction",
+    args: { endpoint, events, registrationKey }
+  });
+}
+async function deleteChannelWebhook({ platform, webhookId }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "deleteWebhookFunction",
+    args: { webhookId }
+  });
+}
+async function getChannelWebhooks({ platform }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "getWebhooksFunction",
+    args: {}
+  });
+}
+async function handleChannelOAuth({ platform, callbackUrl, state }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "oAuthFunction",
+    args: { callbackUrl, state }
+  });
+}
+async function handleChannelOAuthCallback({ platform, code, shop, state, appKey, appSecret, redirectUri }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "oAuthCallbackFunction",
+    args: { code, shop, state, appKey, appSecret, redirectUri }
+  });
+}
+async function handleChannelTrackingWebhook({ platform, event, headers }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "createTrackingWebhookHandler",
+    args: { event, headers }
+  });
+}
+async function handleChannelCancelWebhook({ platform, event, headers }) {
+  return executeChannelAdapterFunction({
+    platform,
+    functionName: "cancelPurchaseWebhookHandler",
+    args: { event, headers }
   });
 }
 var init_executor2 = __esm({
-  "features/integrations/shop/lib/executor.ts"() {
+  "features/integrations/channel/lib/executor.ts"() {
     "use strict";
     init_2();
   }
@@ -3725,9 +4071,11 @@ var import_fields7 = require("@keystone-6/core/fields");
 
 // import("../../integrations/channel/**/*.ts") in features/keystone/utils/channelProviderAdapter.ts
 var globImport_integrations_channel_ts = __glob({
-  "../../integrations/channel/lib/executor.ts": () => Promise.resolve().then(() => (init_executor(), executor_exports)),
+  "../../integrations/channel/lib/executor.ts": () => Promise.resolve().then(() => (init_executor2(), executor_exports2)),
   "../../integrations/channel/openfront.ts": () => Promise.resolve().then(() => (init_openfront(), openfront_exports)),
-  "../../integrations/channel/shopify.ts": () => Promise.resolve().then(() => (init_shopify(), shopify_exports))
+  "../../integrations/channel/shopify.ts": () => Promise.resolve().then(() => (init_shopify(), shopify_exports)),
+  "../../integrations/channel/tracking-relay.ts": () => Promise.resolve().then(() => (init_tracking_relay(), tracking_relay_exports)),
+  "../../integrations/channel/tracking-webhook.ts": () => Promise.resolve().then(() => (init_tracking_webhook(), tracking_webhook_exports))
 });
 
 // features/keystone/utils/channelProviderAdapter.ts
@@ -3789,23 +4137,25 @@ async function createChannelPurchase2({
   platform,
   cartItems,
   shipping,
-  notes
+  notes,
+  idempotencyKey
 }) {
   return executeChannelAdapterFunction2({
     platform,
     functionName: "createPurchaseFunction",
-    args: { cartItems, shipping, notes }
+    args: { cartItems, shipping, notes, idempotencyKey }
   });
 }
 async function createChannelWebhook2({
   platform,
   endpoint,
-  events
+  events,
+  registrationKey
 }) {
   return executeChannelAdapterFunction2({
     platform,
     functionName: "createWebhookFunction",
-    args: { endpoint, events }
+    args: { endpoint, events, registrationKey }
   });
 }
 async function deleteChannelWebhook2({
@@ -3828,7 +4178,9 @@ async function getChannelWebhooks2({ platform }) {
 
 // import("../../integrations/shop/**/*.ts") in features/keystone/utils/shopProviderAdapter.ts
 var globImport_integrations_shop_ts = __glob({
-  "../../integrations/shop/lib/executor.ts": () => Promise.resolve().then(() => (init_executor2(), executor_exports2)),
+  "../../integrations/shop/lib/executor.ts": () => Promise.resolve().then(() => (init_executor(), executor_exports)),
+  "../../integrations/shop/openfront-order-search.ts": () => Promise.resolve().then(() => (init_openfront_order_search(), openfront_order_search_exports)),
+  "../../integrations/shop/openfront-webhook-security.ts": () => Promise.resolve().then(() => (init_openfront_webhook_security(), openfront_webhook_security_exports)),
   "../../integrations/shop/openfront.ts": () => Promise.resolve().then(() => (init_openfront2(), openfront_exports2)),
   "../../integrations/shop/shopify.ts": () => Promise.resolve().then(() => (init_shopify2(), shopify_exports2))
 });
@@ -3899,11 +4251,11 @@ async function addCartToPlatformOrder2({ platform, cartItems, orderId }) {
     args: { cartItems, orderId }
   });
 }
-async function createShopWebhook2({ platform, endpoint, events }) {
+async function createShopWebhook2({ platform, endpoint, events, registrationKey }) {
   return executeShopAdapterFunction2({
     platform,
     functionName: "createWebhookFunction",
-    args: { endpoint, events }
+    args: { endpoint, events, registrationKey }
   });
 }
 async function deleteShopWebhook2({ platform, webhookId }) {
@@ -3921,31 +4273,156 @@ async function getShopWebhooks2({ platform }) {
   });
 }
 
-// features/keystone/lib/placeMultipleOrders.ts
-async function updateCartItems({
-  query,
-  cartItems,
-  url = "",
-  error = "",
-  purchaseId = ""
+// features/keystone/lib/supplierPurchaseClaim.ts
+var import_node_crypto3 = __toESM(require("node:crypto"));
+var SUPPLIER_PURCHASE_PROCESSING = "PURCHASE_PROCESSING";
+var SUPPLIER_PURCHASE_UNKNOWN = "PURCHASE_OUTCOME_UNKNOWN";
+var SUPPLIER_PURCHASE_COMPLETE = "AWAITING";
+var SUPPLIER_PURCHASE_STALE_MS = 5 * 60 * 1e3;
+function shouldReconcileOpenFrontPurchase(claim, createPurchaseFunction3, now = Date.now()) {
+  if (claim.claimed || createPurchaseFunction3 !== "openfront") return false;
+  if (claim.state === SUPPLIER_PURCHASE_UNKNOWN) return true;
+  return claim.state === SUPPLIER_PURCHASE_PROCESSING && Boolean(claim.claimedAt) && now - new Date(claim.claimedAt).getTime() >= SUPPLIER_PURCHASE_STALE_MS;
+}
+function supplierPurchaseAttemptKey({
+  orderId,
+  channelId,
+  cartItemIds
 }) {
-  const update = [];
-  for (const { id } of cartItems) {
-    const res = await query.CartItem.updateOne({
+  const itemIds = [...new Set(cartItemIds)].sort();
+  if (!orderId || !channelId || itemIds.length === 0) {
+    throw new Error("Supplier purchase claim requires an order, channel, and cart items");
+  }
+  return `supplier-purchase:${import_node_crypto3.default.createHash("sha256").update(`${orderId}\0${channelId}\0${itemIds.join("\0")}`).digest("hex")}`;
+}
+async function readClaim(prisma, cartItemIds) {
+  return prisma.cartItem.findMany({
+    where: { id: { in: cartItemIds } },
+    select: {
+      id: true,
+      status: true,
+      purchaseId: true,
+      purchaseAttemptKey: true,
+      purchaseClaimedAt: true
+    }
+  });
+}
+function existingClaimResult(rows, cartItemIds, attemptKey) {
+  if (rows.length === cartItemIds.length && rows.every((row) => row.purchaseAttemptKey === attemptKey)) {
+    const state = rows.every((row) => row.purchaseId) ? SUPPLIER_PURCHASE_COMPLETE : rows.some((row) => row.status === SUPPLIER_PURCHASE_UNKNOWN) ? SUPPLIER_PURCHASE_UNKNOWN : SUPPLIER_PURCHASE_PROCESSING;
+    const claimedAt = rows.map((row) => row.purchaseClaimedAt).filter(Boolean).sort((a, b) => new Date(a).getTime() - new Date(b).getTime())[0] || null;
+    return { claimed: false, attemptKey, state, claimedAt };
+  }
+  return null;
+}
+async function claimSupplierPurchase(prisma, input) {
+  const cartItemIds = [...new Set(input.cartItemIds)].sort();
+  const attemptKey = supplierPurchaseAttemptKey({ ...input, cartItemIds });
+  try {
+    return await prisma.$transaction(async (tx) => {
+      const current = await readClaim(tx, cartItemIds);
+      const existing = existingClaimResult(current, cartItemIds, attemptKey);
+      if (existing) return existing;
+      if (current.length !== cartItemIds.length || current.some(
+        (row) => row.purchaseId || row.purchaseAttemptKey || row.status !== "PENDING"
+      )) {
+        throw new Error("Supplier purchase items are already claimed or changed");
+      }
+      const claimedAt = /* @__PURE__ */ new Date();
+      const claimed = await tx.cartItem.updateMany({
+        where: {
+          id: { in: cartItemIds },
+          orderId: input.orderId,
+          channelId: input.channelId,
+          purchaseId: "",
+          url: "",
+          purchaseAttemptKey: null,
+          status: "PENDING"
+        },
+        data: {
+          purchaseAttemptKey: attemptKey,
+          purchaseClaimedAt: claimedAt,
+          status: SUPPLIER_PURCHASE_PROCESSING,
+          error: ""
+        }
+      });
+      if (claimed.count !== cartItemIds.length) {
+        throw new Error("Supplier purchase claim lost a concurrent race");
+      }
+      return {
+        claimed: true,
+        attemptKey,
+        state: SUPPLIER_PURCHASE_PROCESSING,
+        claimedAt
+      };
+    }, { isolationLevel: "Serializable" });
+  } catch (error) {
+    const winner = existingClaimResult(
+      await readClaim(prisma, cartItemIds),
+      cartItemIds,
+      attemptKey
+    );
+    if (winner) return winner;
+    throw error;
+  }
+}
+async function completeSupplierPurchase(prisma, {
+  attemptKey,
+  cartItemIds,
+  purchaseId,
+  url = ""
+}) {
+  if (!purchaseId) throw new Error("Supplier purchase ID is required");
+  await prisma.$transaction(async (tx) => {
+    const result = await tx.cartItem.updateMany({
       where: {
-        id
+        id: { in: cartItemIds },
+        purchaseAttemptKey: attemptKey,
+        purchaseId: "",
+        status: { in: [SUPPLIER_PURCHASE_PROCESSING, SUPPLIER_PURCHASE_UNKNOWN] }
       },
       data: {
+        purchaseId,
         url,
-        error,
-        purchaseId
+        status: SUPPLIER_PURCHASE_COMPLETE,
+        error: ""
       }
     });
-    update.push(res);
-  }
-  return update;
+    if (result.count !== cartItemIds.length) {
+      throw new Error("Supplier purchase result could not be recorded atomically");
+    }
+  });
 }
-async function placeMultipleOrders({ ids, query }) {
+async function markSupplierPurchaseUnknown(prisma, {
+  attemptKey,
+  cartItemIds,
+  error
+}) {
+  await prisma.$transaction(async (tx) => {
+    const result = await tx.cartItem.updateMany({
+      where: {
+        id: { in: cartItemIds },
+        purchaseAttemptKey: attemptKey,
+        purchaseId: "",
+        status: { in: [SUPPLIER_PURCHASE_PROCESSING, SUPPLIER_PURCHASE_UNKNOWN] }
+      },
+      data: {
+        status: SUPPLIER_PURCHASE_UNKNOWN,
+        error: `PURCHASE_OUTCOME_UNKNOWN [${attemptKey}]: ${error}`
+      }
+    });
+    if (result.count !== cartItemIds.length) {
+      throw new Error("Supplier purchase uncertainty could not be recorded atomically");
+    }
+  });
+}
+
+// features/keystone/lib/placeMultipleOrders.ts
+async function placeMultipleOrders({
+  ids,
+  query,
+  prisma
+}) {
   const processed = [];
   for (const orderId of ids) {
     const {
@@ -3994,6 +4471,7 @@ async function placeMultipleOrders({ ids, query }) {
     });
     const cartChannels = await query.Channel.findMany({
       query: `
+      id
       domain
       accessToken
       cartItems(
@@ -4010,6 +4488,9 @@ async function placeMultipleOrders({ ids, query }) {
         name
         quantity
         price
+        status
+        purchaseAttemptKey
+        lineItemId
       } 
       platform {
         createPurchaseFunction
@@ -4018,12 +4499,22 @@ async function placeMultipleOrders({ ids, query }) {
       `
     });
     for (const {
+      id: channelId,
       domain,
       accessToken,
       cartItems,
       platform,
       metadata
     } of cartChannels.filter((channel) => channel.cartItems.length > 0)) {
+      const cartItemIds = cartItems.map((item) => item.id);
+      const claim = await claimSupplierPurchase(prisma, {
+        orderId,
+        channelId,
+        cartItemIds
+      });
+      if (!claim.claimed && !shouldReconcileOpenFrontPurchase(claim, platform.createPurchaseFunction)) {
+        continue;
+      }
       const body = {
         domain,
         accessToken,
@@ -4068,28 +4559,28 @@ async function placeMultipleOrders({ ids, query }) {
             email: user.email,
             currency
           },
-          notes: ""
+          notes: "",
+          idempotencyKey: claim.attemptKey
         });
-        if (orderPlacementRes.error) {
-          await updateCartItems({
-            cartItems,
-            error: `ORDER_PLACEMENT_ERROR: ${orderPlacementRes.error}`,
-            query
+        if (!orderPlacementRes.purchaseId || orderPlacementRes.error) {
+          await markSupplierPurchaseUnknown(prisma, {
+            attemptKey: claim.attemptKey,
+            cartItemIds,
+            error: orderPlacementRes.error || "Supplier returned no purchase ID"
           });
-        }
-        if (orderPlacementRes.purchaseId) {
-          await updateCartItems({
-            cartItems,
-            url: orderPlacementRes.url,
+        } else {
+          await completeSupplierPurchase(prisma, {
+            attemptKey: claim.attemptKey,
+            cartItemIds,
             purchaseId: orderPlacementRes.purchaseId,
-            query
+            url: orderPlacementRes.url || ""
           });
         }
       } catch (error) {
-        await updateCartItems({
-          cartItems,
-          error: `ORDER_PLACEMENT_ERROR: ${error.message || "Error on order placement. Order may have been placed."}`,
-          query
+        await markSupplierPurchaseUnknown(prisma, {
+          attemptKey: claim.attemptKey,
+          cartItemIds,
+          error: error.message || "Supplier outcome is unknown"
         });
       }
       const cartCount = await query.CartItem.count({
@@ -4178,7 +4669,7 @@ async function placeMultipleOrders({ ids, query }) {
 }
 
 // features/keystone/extendGraphqlSchema/mutations/addMatchToCart.ts
-init_executor();
+init_executor2();
 async function getMatches({ orderId, context }) {
   async function createCartItems({ matches }) {
     if (matches.length > 0) {
@@ -4527,7 +5018,8 @@ var Order = (0, import_core4.list)({
             if (item.processOrder) {
               await placeMultipleOrders({
                 ids: [item.id],
-                query: sudoContext.query
+                query: sudoContext.query,
+                prisma: sudoContext.prisma
               });
             }
           } else {
@@ -4560,7 +5052,8 @@ var Order = (0, import_core4.list)({
                 if (item.processOrder) {
                   const processedOrder = await placeMultipleOrders({
                     ids: [item.id],
-                    query: sudoContext.query
+                    query: sudoContext.query,
+                    prisma: sudoContext.prisma
                   });
                 }
               }
@@ -4578,7 +5071,8 @@ var Order = (0, import_core4.list)({
         } else if (order.cartItemsCount > 0 && item.processOrder) {
           const processedOrder = await placeMultipleOrders({
             ids: [item.id],
-            query: sudoContext.query
+            query: sudoContext.query,
+            prisma: sudoContext.prisma
           });
         }
       }
@@ -4592,7 +5086,7 @@ var Order = (0, import_core4.list)({
   fields: {
     // Order identifiers
     orderId: (0, import_fields7.text)({
-      isIndexed: "unique",
+      isIndexed: true,
       validation: { isRequired: true }
     }),
     orderName: (0, import_fields7.text)(),
@@ -4654,12 +5148,19 @@ var Order = (0, import_core4.list)({
       ref: "User.orders"
     }),
     ...trackingFields
+  },
+  db: {
+    extendPrismaSchema: (schema) => schema.replace(
+      /(model [^}]+)}/g,
+      "$1@@unique([shopId, orderId])\n}"
+    )
   }
 });
 
 // features/keystone/models/TrackingDetail.ts
 var import_core5 = require("@keystone-6/core");
 var import_fields8 = require("@keystone-6/core/fields");
+init_tracking_relay();
 var TrackingDetail = (0, import_core5.list)({
   access: {
     operation: {
@@ -4688,85 +5189,7 @@ var TrackingDetail = (0, import_core5.list)({
     },
     afterOperation: async ({ operation, item, context }) => {
       if (operation === "create") {
-        const sudoContext = context.sudo();
-        const foundTracking = await sudoContext.query.TrackingDetail.findOne({
-          where: { id: String(item.id) },
-          query: `
-            id
-            trackingNumber
-            trackingCompany
-            purchaseId
-            cartItems {
-              id
-              purchaseId
-              order {
-                id
-                orderName
-                orderId
-                status
-                shop {
-                  id
-                  domain
-                  accessToken
-                  platform {
-                    id
-                    name
-                    addTrackingFunction
-                  }
-                }
-              }
-            }
-          `
-        });
-        if (!foundTracking?.cartItems?.length) {
-          return;
-        }
-        const firstCartItem = foundTracking.cartItems[0];
-        const order = firstCartItem.order;
-        if (order.shop?.platform?.addTrackingFunction) {
-          try {
-            const { addShopTracking: addShopTracking2 } = await Promise.resolve().then(() => (init_executor2(), executor_exports2));
-            await addShopTracking2({
-              platform: {
-                ...order.shop.platform,
-                domain: order.shop.domain,
-                accessToken: order.shop.accessToken
-              },
-              order,
-              trackingCompany: foundTracking.trackingCompany,
-              trackingNumber: foundTracking.trackingNumber
-            });
-          } catch (error) {
-            console.error("Error calling addTracking:", error);
-          }
-        }
-        const foundOrder = await sudoContext.query.Order.findOne({
-          where: { id: order.id },
-          query: `
-            id
-            orderName
-            status
-            cartItems(
-              where: {
-                AND: [
-                  { trackingDetails: { none: {} } },
-                  { status: { not: { equals: "CANCELLED" } } }
-                ]
-              }
-            ) {
-              id
-              status
-            }
-          `
-        });
-        if (foundOrder && foundOrder.cartItems.length === 0 && foundOrder.status === "AWAITING") {
-          await sudoContext.query.Order.updateOne({
-            where: { id: foundOrder.id },
-            data: {
-              status: "COMPLETE"
-            }
-          });
-        }
+        await relaySourceTrackingForDetail(context, String(item.id));
       }
     }
   },
@@ -4784,6 +5207,21 @@ var TrackingDetail = (0, import_core5.list)({
       validation: { isRequired: true }
     }),
     purchaseId: (0, import_fields8.text)(),
+    dedupeKey: (0, import_fields8.text)({
+      isIndexed: "unique",
+      db: { isNullable: true },
+      ui: {
+        itemView: { fieldMode: "read" },
+        createView: { fieldMode: "hidden" }
+      }
+    }),
+    fulfillmentLineItems: (0, import_fields8.json)({
+      defaultValue: [],
+      ui: { itemView: { fieldMode: "read" } }
+    }),
+    relayedAt: (0, import_fields8.timestamp)({
+      ui: { itemView: { fieldMode: "read" } }
+    }),
     // Relationships
     cartItems: (0, import_fields8.relationship)({
       ref: "CartItem.trackingDetails",
@@ -4919,6 +5357,14 @@ var CartItem = (0, import_core7.list)({
       }
     }),
     purchaseId: (0, import_fields10.text)(),
+    purchaseAttemptKey: (0, import_fields10.text)({
+      isIndexed: true,
+      db: { isNullable: true },
+      ui: { itemView: { fieldMode: "read" } }
+    }),
+    purchaseClaimedAt: (0, import_fields10.timestamp)({
+      ui: { itemView: { fieldMode: "read" } }
+    }),
     status: (0, import_fields10.text)({ defaultValue: "PENDING" }),
     // Relationships
     order: (0, import_fields10.relationship)({
@@ -4993,6 +5439,10 @@ var Channel = (0, import_core8.list)({
     metadata: (0, import_fields11.json)({
       defaultValue: {}
     }),
+    webhookSecret: (0, import_fields11.text)({
+      access: { read: () => false, create: () => false, update: () => false },
+      ui: { itemView: { fieldMode: "hidden" } }
+    }),
     // Relationships
     platform: (0, import_fields11.relationship)({
       ref: "ChannelPlatform.channels"
@@ -5040,8 +5490,14 @@ var Channel = (0, import_core8.list)({
             ];
             const channelWithPlatform = await context.query.Channel.findOne({
               where: { id: String(item.id) },
-              query: "platform { getWebhooksFunction }"
+              query: "platform { getWebhooksFunction createWebhookFunction }"
             });
+            if (channelWithPlatform?.platform?.createWebhookFunction === "openfront") {
+              const unsupportedIndex = recommendedWebhooks.findIndex(
+                (webhook) => webhook.topic === "ORDER_CANCELLED"
+              );
+              if (unsupportedIndex >= 0) recommendedWebhooks.splice(unsupportedIndex, 1);
+            }
             if (!channelWithPlatform?.platform?.getWebhooksFunction) {
               return {
                 success: false,
@@ -5050,10 +5506,11 @@ var Channel = (0, import_core8.list)({
               };
             }
             const platformConfig = {
+              ...item.metadata || {},
+              resourceId: String(item.id),
               domain: item.domain,
               accessToken: item.accessToken,
-              getWebhooksFunction: channelWithPlatform.platform.getWebhooksFunction,
-              ...item.metadata || {}
+              getWebhooksFunction: channelWithPlatform.platform.getWebhooksFunction
             };
             const webhooksResult = await executeChannelAdapterFunction2({
               platform: platformConfig,
@@ -5237,24 +5694,141 @@ async function getMatchCount(root, { input }, context) {
 }
 var getMatchCount_default = getMatchCount;
 
+// features/keystone/extendGraphqlSchema/mutations/webhook-security.ts
+var import_node_crypto4 = __toESM(require("node:crypto"));
+function webhookRegistrationKey(kind, resourceId, topic) {
+  return `openship:${kind}:${resourceId}:${topic.trim().toUpperCase()}`;
+}
+var ALLOWED_TOPICS = {
+  shop: /* @__PURE__ */ new Set(["ORDER_CREATED", "ORDER_CANCELLED", "ORDER_CHARGEBACKED"]),
+  channel: /* @__PURE__ */ new Set(["TRACKING_CREATED", "ORDER_CANCELLED"])
+};
+function expectedWebhookPath(kind, resourceId, topic) {
+  if (kind === "shop") {
+    return topic === "ORDER_CREATED" ? `/api/handlers/shop/create-order/${resourceId}` : `/api/handlers/shop/cancel-order/${resourceId}`;
+  }
+  return topic === "TRACKING_CREATED" ? `/api/handlers/channel/create-tracking/${resourceId}` : `/api/handlers/channel/cancel-purchase/${resourceId}`;
+}
+function isLocalHostname(hostname) {
+  return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1" || hostname.endsWith(".local");
+}
+function validateWebhookConfiguration(input) {
+  const topic = input.topic.trim().toUpperCase();
+  if (!ALLOWED_TOPICS[input.kind].has(topic)) {
+    throw new Error(`Unsupported ${input.kind} webhook topic`);
+  }
+  let endpoint;
+  try {
+    endpoint = new URL(input.endpoint);
+  } catch {
+    throw new Error("Webhook endpoint must be an absolute URL");
+  }
+  const localDevelopment = process.env.NODE_ENV !== "production" && isLocalHostname(endpoint.hostname);
+  if (endpoint.protocol !== "https:" && !(localDevelopment && endpoint.protocol === "http:")) {
+    throw new Error("Webhook endpoint must use HTTPS");
+  }
+  if (endpoint.username || endpoint.password || endpoint.search || endpoint.hash) {
+    throw new Error("Webhook endpoint cannot contain credentials, query parameters, or fragments");
+  }
+  if (endpoint.pathname !== expectedWebhookPath(input.kind, input.resourceId, topic)) {
+    throw new Error("Webhook endpoint path does not match the requested resource and topic");
+  }
+  if (input.expectedOrigin) {
+    let expectedOrigin;
+    try {
+      expectedOrigin = new URL(input.expectedOrigin).origin;
+    } catch {
+      throw new Error("Configured Openship origin is invalid");
+    }
+    if (endpoint.origin !== expectedOrigin) {
+      throw new Error("Webhook endpoint must use this Openship origin");
+    }
+  }
+  return { topic, endpoint: endpoint.toString() };
+}
+function assertWebhookBelongsToResource(input) {
+  const topics = [...ALLOWED_TOPICS[input.kind]];
+  const absoluteEndpoint = new URL(input.endpoint, input.expectedOrigin).toString();
+  const belongs = topics.some((topic) => {
+    try {
+      validateWebhookConfiguration({
+        ...input,
+        topic,
+        endpoint: absoluteEndpoint
+      });
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  if (!belongs) throw new Error("Webhook does not belong to the requested resource");
+}
+function requestOrigin(context) {
+  if (process.env.NEXT_PUBLIC_URL) {
+    try {
+      return new URL(process.env.NEXT_PUBLIC_URL).origin;
+    } catch {
+      return null;
+    }
+  }
+  if (process.env.NODE_ENV === "production") return null;
+  const headers = context?.req?.headers || {};
+  const hostValue = headers["x-forwarded-host"] || headers.host;
+  const protocolValue = headers["x-forwarded-proto"] || "https";
+  const host = Array.isArray(hostValue) ? hostValue[0] : hostValue;
+  const protocol = Array.isArray(protocolValue) ? protocolValue[0] : protocolValue;
+  if (!host) return null;
+  try {
+    return new URL(`${String(protocol).split(",")[0]}://${String(host).split(",")[0]}`).origin;
+  } catch {
+    return null;
+  }
+}
+async function requireWebhookOwner(context, kind, resourceId) {
+  const session = context.session;
+  if (!session?.itemId) throw new Error("Authentication required");
+  if (!session?.data?.role?.canManageWebhooks) {
+    throw new Error("Webhook management permission required");
+  }
+  const list16 = kind === "shop" ? context.sudo().query.Shop : context.sudo().query.Channel;
+  const resource = await list16.findOne({
+    where: { id: resourceId },
+    query: kind === "shop" ? "id domain accessToken metadata webhookSecret user { id } platform { id name appKey appSecret createWebhookFunction getWebhooksFunction deleteWebhookFunction }" : "id domain accessToken metadata webhookSecret user { id } platform { id name appKey appSecret webhookSecret createWebhookFunction getWebhooksFunction deleteWebhookFunction }"
+  });
+  if (!resource || resource.user?.id !== session.itemId) {
+    throw new Error(`${kind === "shop" ? "Shop" : "Channel"} not found`);
+  }
+  return resource;
+}
+async function ensureConnectionWebhookSecret(context, kind, resource) {
+  const existing = String(resource.webhookSecret || "").trim();
+  if (existing) return existing;
+  const webhookSecret = import_node_crypto4.default.randomBytes(32).toString("hex");
+  const list16 = kind === "shop" ? context.sudo().query.Shop : context.sudo().query.Channel;
+  await list16.updateOne({
+    where: { id: resource.id },
+    data: { webhookSecret },
+    query: "id"
+  });
+  resource.webhookSecret = webhookSecret;
+  return webhookSecret;
+}
+
 // features/keystone/extendGraphqlSchema/queries/getShopWebhooks.ts
 async function getShopWebhooks3(root, { shopId }, context) {
   try {
-    const shop = await context.query.Shop.findOne({
-      where: { id: shopId },
-      query: "id domain accessToken platform { id getWebhooksFunction }"
-    });
-    if (!shop) {
-      throw new Error("Shop not found");
-    }
-    if (!shop.platform) {
-      throw new Error("Platform configuration not specified.");
+    const shop = await requireWebhookOwner(context, "shop", shopId);
+    if (!shop.platform?.getWebhooksFunction) {
+      throw new Error("Get webhooks function not configured.");
     }
     const result = await getShopWebhooks2({
       platform: {
-        ...shop.platform,
+        ...shop.metadata || {},
+        resourceId: shop.id,
+        id: shop.platform.id,
         domain: shop.domain,
-        accessToken: shop.accessToken
+        accessToken: shop.accessToken,
+        getWebhooksFunction: shop.platform.getWebhooksFunction
       }
     });
     return result.webhooks;
@@ -5470,18 +6044,19 @@ var searchChannelProducts_default = searchChannelProductsQuery;
 // features/keystone/extendGraphqlSchema/queries/getChannelWebhooks.ts
 async function getChannelWebhooks3(root, { channelId }, context) {
   try {
-    const channel = await context.query.Channel.findOne({
-      where: { id: channelId },
-      query: "id domain accessToken platform { id getWebhooksFunction }"
-    });
-    if (!channel) {
-      throw new Error("Channel not found");
-    }
-    if (!channel.platform) {
-      throw new Error("Platform configuration not specified.");
+    const channel = await requireWebhookOwner(context, "channel", channelId);
+    if (!channel.platform?.getWebhooksFunction) {
+      throw new Error("Get webhooks function not configured.");
     }
     const result = await getChannelWebhooks2({
-      platform: channel.platform
+      platform: {
+        ...channel.metadata || {},
+        resourceId: channel.id,
+        id: channel.platform.id,
+        domain: channel.domain,
+        accessToken: channel.accessToken,
+        getWebhooksFunction: channel.platform.getWebhooksFunction
+      }
     });
     return result.webhooks;
   } catch (error) {
@@ -5779,6 +6354,10 @@ var Shop = (0, import_core11.list)({
     metadata: (0, import_fields13.json)({
       defaultValue: {}
     }),
+    webhookSecret: (0, import_fields13.text)({
+      access: { read: () => false, create: () => false, update: () => false },
+      ui: { itemView: { fieldMode: "hidden" } }
+    }),
     // Relationships
     platform: (0, import_fields13.relationship)({
       ref: "ShopPlatform.shops"
@@ -5831,8 +6410,14 @@ var Shop = (0, import_core11.list)({
             ];
             const shopWithPlatform = await context.query.Shop.findOne({
               where: { id: item.id },
-              query: "platform { getWebhooksFunction }"
+              query: "platform { getWebhooksFunction createWebhookFunction }"
             });
+            if (shopWithPlatform?.platform?.createWebhookFunction === "openfront") {
+              const unsupportedIndex = recommendedWebhooks.findIndex(
+                (webhook) => webhook.topic === "ORDER_CHARGEBACKED"
+              );
+              if (unsupportedIndex >= 0) recommendedWebhooks.splice(unsupportedIndex, 1);
+            }
             if (!shopWithPlatform?.platform?.getWebhooksFunction) {
               return {
                 success: false,
@@ -5841,10 +6426,11 @@ var Shop = (0, import_core11.list)({
               };
             }
             const platformConfig = {
+              ...item.metadata || {},
+              resourceId: String(item.id),
               domain: item.domain,
               accessToken: item.accessToken,
-              getWebhooksFunction: shopWithPlatform.platform.getWebhooksFunction,
-              ...item.metadata || {}
+              getWebhooksFunction: shopWithPlatform.platform.getWebhooksFunction
             };
             const webhooksResult = await executeShopAdapterFunction2({
               platform: platformConfig,
@@ -6530,6 +7116,19 @@ var ChannelPlatform = (0, import_core19.list)({
       fields: {
         appKey: (0, import_fields18.text)(),
         appSecret: (0, import_fields18.text)(),
+        webhookSecret: (0, import_fields18.text)({
+          db: { isNullable: true },
+          access: {
+            read: () => false,
+            create: () => false,
+            update: () => false
+          },
+          ui: {
+            createView: { fieldMode: "hidden" },
+            itemView: { fieldMode: "hidden" },
+            listView: { fieldMode: "hidden" }
+          }
+        }),
         callbackUrl: (0, import_fields18.virtual)({
           field: import_core19.graphql.field({
             type: import_core19.graphql.String,
@@ -6625,56 +7224,103 @@ var models = {
 var import_schema = require("@graphql-tools/schema");
 
 // features/keystone/extendGraphqlSchema/mutations/addToCart.ts
-async function addToCart(root, { channelId, image, name, price, productId, variantId, quantity, orderId }, context) {
+function positiveQuantity(value) {
+  const quantity = Number(value);
+  if (!Number.isInteger(quantity) || quantity <= 0) {
+    throw new Error("Cart quantity must be a positive integer");
+  }
+  return quantity;
+}
+async function addToCart(_root, {
+  channelId,
+  image,
+  name,
+  price,
+  productId,
+  variantId,
+  quantity: quantityInput,
+  orderId,
+  lineItemId: requestedSourceLineId
+}, context) {
   const session = context.session;
   if (!session?.itemId) {
     throw new Error("You must be logged in to do this!");
   }
-  const allCartItems = await context.query.CartItem.findMany({
+  const quantity = positiveQuantity(quantityInput);
+  const sourceOrder = await context.query.Order.findOne({
+    where: { id: orderId },
+    query: "id status error lineItems { id lineItemId quantity name }"
+  });
+  if (!sourceOrder) throw new Error("Source order not found");
+  const sourceLines = (sourceOrder.lineItems || []).filter(
+    (item) => String(item.lineItemId || "").trim()
+  );
+  const requestedId = String(requestedSourceLineId || "").trim();
+  const matchingSourceLines = requestedId ? sourceLines.filter(
+    (item) => item.id === requestedId || String(item.lineItemId) === requestedId
+  ) : sourceLines.length === 1 ? sourceLines : [];
+  if (matchingSourceLines.length !== 1) {
+    throw new Error(
+      sourceLines.length > 1 ? "Select exactly one source order line for this channel item" : "Channel item must map to exactly one source order line"
+    );
+  }
+  const sourceLine = matchingSourceLines[0];
+  const sourceLineItemId = String(sourceLine.lineItemId);
+  const mappedCartItems = await context.query.CartItem.findMany({
     where: {
       order: { id: { equals: orderId } },
-      channel: { id: { equals: channelId } },
       user: { id: { equals: session.itemId } },
-      productId: { equals: productId },
-      variantId: { equals: variantId },
-      status: { not: { equals: "CANCELLED" } },
-      purchaseId: { equals: "" },
-      url: { equals: "" }
+      lineItemId: { equals: sourceLineItemId },
+      status: { not: { equals: "CANCELLED" } }
     },
-    query: "id quantity"
+    query: "id quantity productId variantId purchaseId url channel { id }"
   });
-  const [existingCartItem] = allCartItems;
+  const alreadyRouted = mappedCartItems.reduce(
+    (total, item) => total + Number(item.quantity || 0),
+    0
+  );
+  if (alreadyRouted + quantity > Number(sourceLine.quantity || 0)) {
+    throw new Error(
+      `Routing quantity exceeds the remaining quantity for ${sourceLine.name || "the source line"}`
+    );
+  }
+  const existingCartItem = mappedCartItems.find(
+    (item) => item.channel?.id === channelId && item.productId === productId && item.variantId === variantId && !item.purchaseId && !item.url
+  );
   if (existingCartItem) {
     await context.query.CartItem.updateOne({
       where: { id: existingCartItem.id },
       data: {
-        quantity: existingCartItem.quantity + parseInt(quantity, 10)
-      }
+        quantity: Number(existingCartItem.quantity || 0) + quantity,
+        lineItemId: sourceLineItemId
+      },
+      query: "id"
     });
-    return await context.db.Order.findOne({
-      where: {
-        id: orderId
-      }
+  } else {
+    await context.query.CartItem.createOne({
+      data: {
+        price,
+        productId,
+        variantId,
+        lineItemId: sourceLineItemId,
+        quantity,
+        image,
+        name,
+        user: { connect: { id: session.itemId } },
+        order: { connect: { id: orderId } },
+        channel: { connect: { id: channelId } }
+      },
+      query: "id"
     });
   }
-  await context.query.CartItem.createOne({
-    data: {
-      price,
-      productId,
-      variantId,
-      quantity: parseInt(quantity, 10),
-      image,
-      name,
-      user: { connect: { id: session.itemId } },
-      order: { connect: { id: orderId } },
-      channel: { connect: { id: channelId } }
-    }
-  });
-  return await context.db.Order.findOne({
-    where: {
-      id: orderId
-    }
-  });
+  if (String(sourceOrder.error || "").startsWith("MATCH_ERROR")) {
+    await context.query.Order.updateOne({
+      where: { id: orderId },
+      data: { error: "", status: "PENDING" },
+      query: "id"
+    });
+  }
+  return context.db.Order.findOne({ where: { id: orderId } });
 }
 var addToCart_default = addToCart;
 
@@ -7026,7 +7672,8 @@ async function placeOrders(root, { ids }, context) {
   }
   const processedOrders = await placeMultipleOrders({
     ids,
-    query: context.query
+    query: context.query,
+    prisma: context.prisma
   });
   return processedOrders;
 }
@@ -7035,44 +7682,41 @@ var placeOrders_default = placeOrders;
 // features/keystone/extendGraphqlSchema/mutations/createShopWebhook.ts
 async function createShopWebhook3(root, { shopId, topic, endpoint }, context) {
   try {
-    const sudoContext = context.sudo();
-    const shop = await sudoContext.query.Shop.findOne({
-      where: { id: shopId },
-      query: `
-        id
-        domain
-        accessToken
-        metadata
-        platform {
-          id
-          name
-          createWebhookFunction
-        }
-      `
-    });
-    if (!shop) {
-      return { success: false, error: "Shop not found" };
-    }
-    if (!shop.platform) {
-      return { success: false, error: "Platform configuration not specified." };
-    }
-    if (!shop.platform.createWebhookFunction) {
+    const shop = await requireWebhookOwner(context, "shop", shopId);
+    if (!shop.platform?.createWebhookFunction) {
       return { success: false, error: "Create webhook function not configured." };
     }
-    const platformConfig = {
-      domain: shop.domain,
-      accessToken: shop.accessToken,
-      createWebhookFunction: shop.platform.createWebhookFunction,
-      ...shop.metadata
-    };
-    const result = await createShopWebhook2({
-      platform: platformConfig,
+    const expectedOrigin = requestOrigin(context);
+    if (!expectedOrigin) {
+      return { success: false, error: "Configured Openship origin is required." };
+    }
+    const validated = validateWebhookConfiguration({
+      kind: "shop",
+      resourceId: shopId,
+      topic,
       endpoint,
-      events: [topic]
+      expectedOrigin
+    });
+    const webhookSecret = shop.platform.createWebhookFunction === "openfront" ? await ensureConnectionWebhookSecret(context, "shop", shop) : void 0;
+    const result = await createShopWebhook2({
+      platform: {
+        ...shop.metadata || {},
+        resourceId: shop.id,
+        webhookSecret,
+        id: shop.platform.id,
+        domain: shop.domain,
+        accessToken: shop.accessToken,
+        appKey: shop.platform.appKey,
+        appSecret: shop.platform.appSecret,
+        createWebhookFunction: shop.platform.createWebhookFunction
+      },
+      endpoint: validated.endpoint,
+      events: [validated.topic],
+      registrationKey: webhookRegistrationKey("shop", shopId, validated.topic)
     });
     return { success: true, webhookId: result.webhookId };
   } catch (error) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : "Webhook creation failed" };
   }
 }
 var createShopWebhook_default = createShopWebhook3;
@@ -7080,27 +7724,34 @@ var createShopWebhook_default = createShopWebhook3;
 // features/keystone/extendGraphqlSchema/mutations/deleteShopWebhook.ts
 async function deleteShopWebhook3(root, { shopId, webhookId }, context) {
   try {
-    const shop = await context.query.Shop.findOne({
-      where: { id: shopId },
-      query: "id domain accessToken platform { id deleteWebhookFunction }"
-    });
-    if (!shop) {
-      return { success: false, error: "Shop not found" };
+    const shop = await requireWebhookOwner(context, "shop", shopId);
+    if (!shop.platform?.deleteWebhookFunction || !shop.platform?.getWebhooksFunction) {
+      return { success: false, error: "Webhook functions not configured." };
     }
-    if (!shop.platform) {
-      return { success: false, error: "Platform configuration not specified." };
-    }
-    await deleteShopWebhook2({
-      platform: {
-        ...shop.platform,
-        domain: shop.domain,
-        accessToken: shop.accessToken
-      },
-      webhookId
+    const expectedOrigin = requestOrigin(context);
+    if (!expectedOrigin) return { success: false, error: "Unable to determine Openship origin." };
+    const platform = {
+      ...shop.metadata || {},
+      resourceId: shop.id,
+      id: shop.platform.id,
+      domain: shop.domain,
+      accessToken: shop.accessToken,
+      getWebhooksFunction: shop.platform.getWebhooksFunction,
+      deleteWebhookFunction: shop.platform.deleteWebhookFunction
+    };
+    const result = await getShopWebhooks2({ platform });
+    const webhook = (result.webhooks || []).find((item) => String(item.id) === webhookId);
+    if (!webhook) return { success: false, error: "Webhook not found." };
+    assertWebhookBelongsToResource({
+      kind: "shop",
+      resourceId: shopId,
+      endpoint: webhook.callbackUrl,
+      expectedOrigin
     });
+    await deleteShopWebhook2({ platform, webhookId });
     return { success: true };
   } catch (error) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : "Webhook deletion failed" };
   }
 }
 var deleteShopWebhook_default = deleteShopWebhook3;
@@ -7155,44 +7806,41 @@ var updateShopProduct_default = updateShopProduct3;
 // features/keystone/extendGraphqlSchema/mutations/createChannelWebhook.ts
 async function createChannelWebhook3(root, { channelId, topic, endpoint }, context) {
   try {
-    const sudoContext = context.sudo();
-    const channel = await sudoContext.query.Channel.findOne({
-      where: { id: channelId },
-      query: `
-        id
-        domain
-        accessToken
-        metadata
-        platform {
-          id
-          name
-          createWebhookFunction
-        }
-      `
-    });
-    if (!channel) {
-      return { success: false, error: "Channel not found" };
-    }
-    if (!channel.platform) {
-      return { success: false, error: "Platform configuration not specified." };
-    }
-    if (!channel.platform.createWebhookFunction) {
+    const channel = await requireWebhookOwner(context, "channel", channelId);
+    if (!channel.platform?.createWebhookFunction) {
       return { success: false, error: "Create webhook function not configured." };
     }
-    const platformConfig = {
-      domain: channel.domain,
-      accessToken: channel.accessToken,
-      createWebhookFunction: channel.platform.createWebhookFunction,
-      ...channel.metadata
-    };
-    const result = await createChannelWebhook2({
-      platform: platformConfig,
+    const expectedOrigin = requestOrigin(context);
+    if (!expectedOrigin) {
+      return { success: false, error: "Configured Openship origin is required." };
+    }
+    const validated = validateWebhookConfiguration({
+      kind: "channel",
+      resourceId: channelId,
+      topic,
       endpoint,
-      events: [topic]
+      expectedOrigin
+    });
+    const webhookSecret = channel.platform.createWebhookFunction === "openfront" ? await ensureConnectionWebhookSecret(context, "channel", channel) : void 0;
+    const result = await createChannelWebhook2({
+      platform: {
+        ...channel.metadata || {},
+        resourceId: channel.id,
+        id: channel.platform.id,
+        domain: channel.domain,
+        accessToken: channel.accessToken,
+        appKey: channel.platform.appKey,
+        appSecret: channel.platform.appSecret,
+        webhookSecret: webhookSecret || channel.platform.webhookSecret,
+        createWebhookFunction: channel.platform.createWebhookFunction
+      },
+      endpoint: validated.endpoint,
+      events: [validated.topic],
+      registrationKey: webhookRegistrationKey("channel", channelId, validated.topic)
     });
     return { success: true, webhookId: result.webhookId };
   } catch (error) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : "Webhook creation failed" };
   }
 }
 var createChannelWebhook_default = createChannelWebhook3;
@@ -7200,27 +7848,34 @@ var createChannelWebhook_default = createChannelWebhook3;
 // features/keystone/extendGraphqlSchema/mutations/deleteChannelWebhook.ts
 async function deleteChannelWebhook3(root, { channelId, webhookId }, context) {
   try {
-    const channel = await context.query.Channel.findOne({
-      where: { id: channelId },
-      query: "id domain accessToken platform { id deleteWebhookFunction }"
-    });
-    if (!channel) {
-      return { success: false, error: "Channel not found" };
+    const channel = await requireWebhookOwner(context, "channel", channelId);
+    if (!channel.platform?.deleteWebhookFunction || !channel.platform?.getWebhooksFunction) {
+      return { success: false, error: "Webhook functions not configured." };
     }
-    if (!channel.platform) {
-      return { success: false, error: "Platform configuration not specified." };
-    }
-    await deleteChannelWebhook2({
-      platform: {
-        ...channel.platform,
-        domain: channel.domain,
-        accessToken: channel.accessToken
-      },
-      webhookId
+    const expectedOrigin = requestOrigin(context);
+    if (!expectedOrigin) return { success: false, error: "Unable to determine Openship origin." };
+    const platform = {
+      ...channel.metadata || {},
+      resourceId: channel.id,
+      id: channel.platform.id,
+      domain: channel.domain,
+      accessToken: channel.accessToken,
+      getWebhooksFunction: channel.platform.getWebhooksFunction,
+      deleteWebhookFunction: channel.platform.deleteWebhookFunction
+    };
+    const result = await getChannelWebhooks2({ platform });
+    const webhook = (result.webhooks || []).find((item) => String(item.id) === webhookId);
+    if (!webhook) return { success: false, error: "Webhook not found." };
+    assertWebhookBelongsToResource({
+      kind: "channel",
+      resourceId: channelId,
+      endpoint: webhook.callbackUrl,
+      expectedOrigin
     });
+    await deleteChannelWebhook2({ platform, webhookId });
     return { success: true };
   } catch (error) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : "Webhook deletion failed" };
   }
 }
 var deleteChannelWebhook_default = deleteChannelWebhook3;
@@ -7355,6 +8010,7 @@ var typeDefs = graphql9`
       variantId: String
       quantity: String
       orderId: ID
+      lineItemId: String
     ): Order
     placeOrders(ids: [ID!]!): [Order]
     addMatchToCart(orderId: ID!): Order

@@ -1,37 +1,21 @@
 import { createChannelPurchase } from "../utils/channelProviderAdapter";
 import { addCartToPlatformOrder } from "../utils/shopProviderAdapter";
+import {
+  claimSupplierPurchase,
+  completeSupplierPurchase,
+  markSupplierPurchaseUnknown,
+  shouldReconcileOpenFrontPurchase,
+} from "./supplierPurchaseClaim";
 
-async function updateCartItems({
+export async function placeMultipleOrders({
+  ids,
   query,
-  cartItems,
-  url = "",
-  error = "",
-  purchaseId = "",
+  prisma,
 }: {
+  ids: string[];
   query: any;
-  cartItems: Array<{ id: string }>;
-  url?: string;
-  error?: string;
-  purchaseId?: string;
+  prisma: any;
 }) {
-  const update = [];
-  for (const { id } of cartItems) {
-    const res = await query.CartItem.updateOne({
-      where: {
-        id,
-      },
-      data: {
-        url,
-        error,
-        purchaseId,
-      },
-    });
-    update.push(res);
-  }
-  return update;
-}
-
-export async function placeMultipleOrders({ ids, query }: { ids: string[]; query: any }) {
   const processed = [];
   for (const orderId of ids) {
     const {
@@ -81,6 +65,7 @@ export async function placeMultipleOrders({ ids, query }: { ids: string[]; query
 
     const cartChannels = await query.Channel.findMany({
       query: `
+      id
       domain
       accessToken
       cartItems(
@@ -97,6 +82,9 @@ export async function placeMultipleOrders({ ids, query }: { ids: string[]; query
         name
         quantity
         price
+        status
+        purchaseAttemptKey
+        lineItemId
       } 
       platform {
         createPurchaseFunction
@@ -106,12 +94,25 @@ export async function placeMultipleOrders({ ids, query }: { ids: string[]; query
     });
 
     for (const {
+      id: channelId,
       domain,
       accessToken,
       cartItems,
       platform,
       metadata,
     } of cartChannels.filter((channel: any) => channel.cartItems.length > 0)) {
+      const cartItemIds = cartItems.map((item: any) => item.id);
+      const claim = await claimSupplierPurchase(prisma, {
+        orderId,
+        channelId,
+        cartItemIds,
+      });
+      if (
+        !claim.claimed &&
+        !shouldReconcileOpenFrontPurchase(claim, platform.createPurchaseFunction)
+      ) {
+        continue;
+      }
       const body = {
         domain,
         accessToken,
@@ -158,31 +159,30 @@ export async function placeMultipleOrders({ ids, query }: { ids: string[]; query
             phone,
             email: user.email,
             currency,
-                },
+          },
           notes: "",
+          idempotencyKey: claim.attemptKey,
         });
 
-        if (orderPlacementRes.error) {
-          await updateCartItems({
-            cartItems,
-            error: `ORDER_PLACEMENT_ERROR: ${orderPlacementRes.error}`,
-            query,
+        if (!orderPlacementRes.purchaseId || orderPlacementRes.error) {
+          await markSupplierPurchaseUnknown(prisma, {
+            attemptKey: claim.attemptKey,
+            cartItemIds,
+            error: orderPlacementRes.error || "Supplier returned no purchase ID",
           });
-        }
-
-        if (orderPlacementRes.purchaseId) {
-          await updateCartItems({
-            cartItems,
-            url: orderPlacementRes.url,
+        } else {
+          await completeSupplierPurchase(prisma, {
+            attemptKey: claim.attemptKey,
+            cartItemIds,
             purchaseId: orderPlacementRes.purchaseId,
-            query,
+            url: orderPlacementRes.url || "",
           });
         }
       } catch (error: any) {
-        await updateCartItems({
-          cartItems,
-          error: `ORDER_PLACEMENT_ERROR: ${error.message || "Error on order placement. Order may have been placed."}`,
-          query,
+        await markSupplierPurchaseUnknown(prisma, {
+          attemptKey: claim.attemptKey,
+          cartItemIds,
+          error: error.message || "Supplier outcome is unknown",
         });
       }
 

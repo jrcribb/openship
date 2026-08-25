@@ -435,10 +435,16 @@ export async function createWebhookFunction({
       },
     }) as any;
 
+    if (result.webhookSubscriptionCreate.userErrors.length > 0) {
+      throw new Error(result.webhookSubscriptionCreate.userErrors[0].message);
+    }
     webhooks.push(result.webhookSubscriptionCreate.webhookSubscription);
   }
 
-  return { webhooks };
+  return {
+    webhooks,
+    webhookId: webhooks[0]?.id?.split("/").pop(),
+  };
 }
 
 export async function deleteWebhookFunction({

@@ -255,8 +255,8 @@ export async function createMatch(data: Record<string, unknown>) {
     mutation CreateMatch($data: MatchCreateInput!) {
       createMatch(data: $data) {
         id
-        input
-        output
+        input { id }
+        output { id }
         createdAt
       }
     }
@@ -277,8 +277,8 @@ export async function updateMatch(id: string, data: Record<string, unknown>) {
     mutation UpdateMatch($where: MatchWhereUniqueInput!, $data: MatchUpdateInput!) {
       updateMatch(where: $where, data: $data) {
         id
-        input
-        output
+        input { id }
+        output { id }
         updatedAt
       }
     }

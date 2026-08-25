@@ -51,19 +51,19 @@ export async function getChannelProduct({ platform, productId }: { platform: any
   });
 }
 
-export async function createChannelPurchase({ platform, cartItems, shipping, notes }: { platform: any; cartItems: any; shipping: any; notes?: string }) {
+export async function createChannelPurchase({ platform, cartItems, shipping, notes, idempotencyKey }: { platform: any; cartItems: any; shipping: any; notes?: string; idempotencyKey?: string }) {
   return executeChannelAdapterFunction({
     platform,
     functionName: "createPurchaseFunction",
-    args: { cartItems, shipping, notes },
+    args: { cartItems, shipping, notes, idempotencyKey },
   });
 }
 
-export async function createChannelWebhook({ platform, endpoint, events }: { platform: any; endpoint: string; events: string[] }) {
+export async function createChannelWebhook({ platform, endpoint, events, registrationKey }: { platform: any; endpoint: string; events: string[]; registrationKey?: string }) {
   return executeChannelAdapterFunction({
     platform,
     functionName: "createWebhookFunction",
-    args: { endpoint, events },
+    args: { endpoint, events, registrationKey },
   });
 }
 

@@ -55,8 +55,10 @@ export function OrderPageClient({
       } else if(response?.error) {
         throw new Error(response?.error || 'An unknown error occurred.');
       }
+      return response;
     } catch (error: any) {
       toast({ title: 'Action Failed', description: error.message, variant: 'destructive' });
+      return { success: false, error: error.message || 'Action failed' };
     } finally {
       setLoadingActions(prev => ({ ...prev, [action]: { ...(prev[action] || {}), [orderId]: false } }));
     }

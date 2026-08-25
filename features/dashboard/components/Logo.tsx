@@ -1,8 +1,8 @@
 import { cn } from "@/lib/utils";
-import { Space_Grotesk } from "next/font/google";
+import { Syne } from "next/font/google";
 import { LogoIcon } from "./LogoIcon";
 
-const spaceGrotesk = Space_Grotesk({
+const syne = Syne({
   subsets: ["latin"],
   display: "swap",
   adjustFontFallback: false,
@@ -20,13 +20,17 @@ export const Logo = ({
   iconClassName,
 }: LogoProps) => {
   return (
-    <div className={cn(spaceGrotesk.className, className)}>
-      <div className="flex items-center gap-2 text-zinc-700 dark:text-white">
-        <LogoIcon className={cn("size-5", iconClassName)} suffix="-full" />
-          <h1 className={cn(textClassName, "mb-1 text-xl font-semibold tracking-tight")} >
-          open<span className="font-normal">ship</span>
-        </h1>
-      </div>
+    <div className={cn(className, "flex items-center gap-3 text-left")}>
+      <LogoIcon className={cn("size-8 shrink-0", iconClassName)} color="#009966" suffix="-full" />
+      <span
+        className={cn(
+          syne.className,
+          textClassName,
+          "text-xl font-semibold tracking-tight text-foreground",
+        )}
+      >
+        open<span className="font-normal">ship</span>
+      </span>
     </div>
   );
 };

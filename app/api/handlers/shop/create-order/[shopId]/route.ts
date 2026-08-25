@@ -25,19 +25,8 @@ export async function POST(
     const headers = Object.fromEntries(request.headers.entries());
     const { shopId } = await params;
 
-    console.log('=== WEBHOOK RECEIVED ===');
-    console.log('Shop ID:', shopId);
-    console.log('Headers:', JSON.stringify(headers, null, 2));
-    console.log('Webhook Body:', JSON.stringify(body, null, 2));
-    console.log('========================');
-
-    // Respond immediately to acknowledge receipt
-    const response = NextResponse.json({ received: true });
-
-    // Process webhook asynchronously
-    processWebhook(shopId, body, headers);
-
-    return response;
+    await processWebhook(shopId, body, headers);
+    return NextResponse.json({ received: true });
   } catch (error) {
     console.error('WEBHOOK ENDPOINT ERROR:', error);
     return NextResponse.json({ error: 'Webhook processing failed' }, { status: 500 });
@@ -45,9 +34,6 @@ export async function POST(
 }
 
 async function processWebhook(shopId: string, body: any, headers: any) {
-  try {
-    console.log('=== PROCESSING WEBHOOK ===');
-    
     // Find the shop and its platform
     const shop = await keystoneContext.sudo().query.Shop.findOne({
       where: { id: shopId },
@@ -55,6 +41,8 @@ async function processWebhook(shopId: string, body: any, headers: any) {
         id
         domain
         accessToken
+        metadata
+        webhookSecret
         user {
           id
           email
@@ -75,28 +63,16 @@ async function processWebhook(shopId: string, body: any, headers: any) {
       `,
     });
 
-    if (!shop) {
-      console.error('Shop not found:', shopId);
-      return;
-    }
-
-    console.log('Shop found:', {
-      id: shop.id,
-      domain: shop.domain,
-      platform: shop.platform.name,
-      userId: shop.user.id
-    });
+    if (!shop) throw new Error(`Shop not found: ${shopId}`);
 
     // Use the shop provider adapter to handle the webhook
-    console.log('Calling handleShopOrderWebhook with platform:', {
-      platformName: shop.platform.name,
-      domain: shop.domain,
-      hasAccessToken: !!shop.accessToken
-    });
 
     const orderData = await handleShopOrderWebhook({
       platform: {
         ...shop.platform,
+        ...(shop.metadata || {}),
+        webhookSecret: shop.webhookSecret,
+        resourceId: shop.id,
         domain: shop.domain,
         accessToken: shop.accessToken,
       },
@@ -104,21 +80,30 @@ async function processWebhook(shopId: string, body: any, headers: any) {
       headers,
     });
 
-    console.log('Order data from webhook handler:', JSON.stringify(orderData, null, 2));
-
-    // Log the data that will be sent to Keystone after removeEmpty
+    // Build the Keystone input only after signature verification succeeds.
     const finalOrderData = removeEmpty({
       ...orderData,
       shop: { connect: { id: shop.id } },
       user: { connect: { id: shop.user.id } },
     });
-    
-    console.log('Final order data (after removeEmpty):', JSON.stringify(finalOrderData, null, 2));
 
-    // Create the order in the database using removeEmpty (like Dasher)
-    const createdOrder = await keystoneContext.sudo().query.Order.createOne({
-      data: finalOrderData,
-      query: `
+    // OpenFront delivery is at-least-once. The unique source order ID is the
+    // durable idempotency boundary; replays acknowledge the canonical row.
+    const existingOrder = await keystoneContext.sudo().query.Order.findMany({
+      where: {
+        orderId: { equals: finalOrderData.orderId },
+        shop: { id: { equals: shop.id } },
+      },
+      take: 1,
+      query: 'id orderId',
+    });
+    if (existingOrder[0]) return existingOrder[0];
+
+    let createdOrder;
+    try {
+      createdOrder = await keystoneContext.sudo().query.Order.createOne({
+        data: finalOrderData,
+        query: `
         id
         orderId
         orderName
@@ -160,14 +145,20 @@ async function processWebhook(shopId: string, body: any, headers: any) {
             }
           }
         }
-      `,
-    });
+        `,
+      });
+    } catch (error) {
+      const winner = await keystoneContext.sudo().query.Order.findMany({
+        where: {
+          orderId: { equals: finalOrderData.orderId },
+          shop: { id: { equals: shop.id } },
+        },
+        take: 1,
+        query: 'id orderId',
+      });
+      if (!winner[0]) throw error;
+      createdOrder = winner[0];
+    }
 
-    console.log('Order created successfully:', JSON.stringify(createdOrder, null, 2));
-    console.log('========================');
-
-  } catch (error) {
-    console.error('WEBHOOK PROCESSING ERROR:', error instanceof Error ? error.message : 'Unknown error');
-    console.error('Full error:', error);
-  }
+    return createdOrder;
 }

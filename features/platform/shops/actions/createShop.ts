@@ -3,6 +3,11 @@
 import { redirect } from 'next/navigation';
 import { keystoneClient } from "@/features/dashboard/lib/keystoneClient";
 import { handleShopOAuth } from '../../../keystone/utils/shopProviderAdapter';
+import { cookies } from 'next/headers';
+import {
+  openPendingShopOAuth,
+  SHOP_OAUTH_PENDING_COOKIE,
+} from '@/features/integrations/lib/oauth-pending';
 
 export interface CreateShopInput {
   name: string;
@@ -10,10 +15,7 @@ export interface CreateShopInput {
   accessToken: string;
   refreshToken?: string;
   tokenExpiresAt?: Date;
-  platformId?: string; // Optional for marketplace flow
-  platform?: { // For inline platform creation
-    create: any;
-  };
+  platformId: string;
 }
 
 export async function createShop(data: CreateShopInput) {
@@ -33,21 +35,6 @@ export async function createShop(data: CreateShopInput) {
       }
     }
   `;
-
-  // Handle platform connection (existing) vs creation (inline)
-  let platformData;
-  if (data.platformId) {
-    // Existing platform - connect by ID
-    // Using existing platform ID
-    platformData = { connect: { id: data.platformId } };
-  } else if (data.platform?.create) {
-    // Inline platform creation
-    // Creating platform inline
-    platformData = { create: data.platform.create };
-  } else {
-    // No platform connection method provided
-    throw new Error('Either platformId or platform.create must be provided');
-  }
 
   const variables: { 
     data: { 
@@ -74,7 +61,7 @@ export async function createShop(data: CreateShopInput) {
     variables.data.tokenExpiresAt = data.tokenExpiresAt.toISOString();
   }
 
-  variables.data.platform = platformData;
+  variables.data.platform = { connect: { id: data.platformId } };
 
   const response = await keystoneClient(mutation, variables);
 
@@ -85,6 +72,31 @@ export async function createShop(data: CreateShopInput) {
       success: false,
       error: response.error || 'Failed to create shop'
     };
+  }
+}
+
+export async function completeShopOAuthConnection(name: string) {
+  const cookieStore = await cookies();
+  const sealedGrant = cookieStore.get(SHOP_OAUTH_PENDING_COOKIE)?.value;
+  if (!sealedGrant) return { success: false, error: 'OAuth connection grant is missing or expired' };
+
+  try {
+    const pending = openPendingShopOAuth(
+      sealedGrant,
+      process.env.OAUTH_STATE_SECRET || 'openship-local-development-oauth-state-secret'
+    );
+    const result = await createShop({
+      name: name.trim(),
+      domain: pending.domain,
+      accessToken: pending.accessToken,
+      refreshToken: pending.refreshToken,
+      tokenExpiresAt: pending.tokenExpiresAt ? new Date(pending.tokenExpiresAt) : undefined,
+      platformId: pending.platformId,
+    });
+    if (result.success) cookieStore.delete(SHOP_OAUTH_PENDING_COOKIE);
+    return result;
+  } catch (error) {
+    return { success: false, error: error instanceof Error ? error.message : 'Invalid OAuth connection grant' };
   }
 }
 

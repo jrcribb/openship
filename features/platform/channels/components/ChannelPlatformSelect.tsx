@@ -57,7 +57,6 @@ export function ChannelPlatformSelect({
               id
               name
               appKey
-              appSecret
               oAuthFunction
               oAuthCallbackFunction
             }
@@ -73,7 +72,6 @@ export function ChannelPlatformSelect({
         });
 
         const result = await response.json();
-        console.log('ChannelPlatformSelect fetch result:', result);
 
         if (result.errors) {
           setError(result.errors[0].message);
@@ -82,7 +80,6 @@ export function ChannelPlatformSelect({
 
         if (result.data?.channelPlatforms) {
           setPlatforms(result.data.channelPlatforms);
-          console.log('ChannelPlatformSelect platforms loaded:', result.data.channelPlatforms);
         } else {
           setError('No platforms found');
         }
@@ -131,14 +128,11 @@ export function ChannelPlatformSelect({
           <SelectValue placeholder="Select a platform" />
         </SelectTrigger>
         <SelectContent>
-          {platforms.map((platform) => {
-            console.log('Rendering channel platform:', platform);
-            return (
-              <SelectItem key={platform.id} value={platform.id}>
-                {platform.name}
-              </SelectItem>
-            );
-          })}
+          {platforms.map((platform) => (
+            <SelectItem key={platform.id} value={platform.id}>
+              {platform.name}
+            </SelectItem>
+          ))}
         </SelectContent>
       </Select>
     </div>

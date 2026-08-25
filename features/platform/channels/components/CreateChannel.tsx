@@ -51,7 +51,6 @@ export function CreateChannel({ onChannelCreated, trigger }: CreateChannelProps 
       // Check if this is OAuth platform
       if (
         selectedPlatformData?.appKey &&
-        selectedPlatformData?.appSecret &&
         selectedPlatformData?.oAuthFunction &&
         selectedPlatformData?.oAuthCallbackFunction
       ) {
@@ -62,7 +61,6 @@ export function CreateChannel({ onChannelCreated, trigger }: CreateChannelProps 
           return;
         }
         
-        console.log('Initiating OAuth flow for domain:', domain);
         await initiateOAuthFlow(selectedPlatform, domain);
         return;
       }
@@ -73,13 +71,6 @@ export function CreateChannel({ onChannelCreated, trigger }: CreateChannelProps 
         setIsLoading(false);
         return;
       }
-
-      console.log('Creating channel with:', {
-        name,
-        domain,
-        accessToken,
-        platformId: selectedPlatform
-      });
 
       const result = await createChannel({
         name,
@@ -152,7 +143,7 @@ export function CreateChannel({ onChannelCreated, trigger }: CreateChannelProps 
           {selectedPlatform && selectedPlatformData && (
             <div className="space-y-4">
               {/* Check if platform has OAuth - if it does AND has app credentials, only show domain */}
-              {selectedPlatformData.oAuthFunction && selectedPlatformData.oAuthCallbackFunction && selectedPlatformData.appKey && selectedPlatformData.appSecret ? (
+              {selectedPlatformData.oAuthFunction && selectedPlatformData.oAuthCallbackFunction && selectedPlatformData.appKey ? (
                 <div>
                   <Label htmlFor="domain">Domain</Label>
                   <Input
@@ -217,7 +208,7 @@ export function CreateChannel({ onChannelCreated, trigger }: CreateChannelProps 
             onClick={handleChannelCreation}
           >
             {isLoading ? "Creating..." : 
-             (selectedPlatformData?.oAuthFunction && selectedPlatformData?.oAuthCallbackFunction && selectedPlatformData?.appKey && selectedPlatformData?.appSecret
+             (selectedPlatformData?.oAuthFunction && selectedPlatformData?.oAuthCallbackFunction && selectedPlatformData?.appKey
               ? `Install App on ${selectedPlatformData.name}` : "Create Channel")}
           </Button>
         </DialogFooter>

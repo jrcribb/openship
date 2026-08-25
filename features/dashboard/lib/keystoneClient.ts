@@ -111,10 +111,14 @@ export async function keystoneClient<T = any>(
     };
 
   } catch (error) {
-    console.error("Error fetching GraphQL data:", error);
-
+    // graphql-request ClientError includes the complete request variables. Those
+    // may contain OAuth credentials or access tokens, so never log it directly.
     if (error instanceof ClientError) {
       const { message, errors } = formatGraphQLErrors(error);
+      console.error("GraphQL request failed", {
+        message,
+        status: error.response?.status,
+      });
       return {
         success: false,
         error: message,
@@ -122,9 +126,11 @@ export async function keystoneClient<T = any>(
       };
     }
 
+    const message = error instanceof Error ? error.message : 'Unknown error occurred';
+    console.error("GraphQL request failed", { message });
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Unknown error occurred'
+      error: message
     };
   }
 }

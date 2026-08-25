@@ -1,4 +1,12 @@
-import { deleteShopWebhook as executeDeleteShopWebhook } from "../../utils/shopProviderAdapter";
+import {
+  deleteShopWebhook as executeDeleteShopWebhook,
+  getShopWebhooks as executeGetShopWebhooks,
+} from "../../utils/shopProviderAdapter";
+import {
+  assertWebhookBelongsToResource,
+  requestOrigin,
+  requireWebhookOwner,
+} from "./webhook-security";
 
 interface DeleteShopWebhookArgs {
   shopId: string;
@@ -11,32 +19,36 @@ async function deleteShopWebhook(
   context: any
 ) {
   try {
-    // Fetch the shop using the provided shopId
-    const shop = await context.query.Shop.findOne({
-      where: { id: shopId },
-      query: "id domain accessToken platform { id deleteWebhookFunction }",
+    const shop = await requireWebhookOwner(context, "shop", shopId);
+    if (!shop.platform?.deleteWebhookFunction || !shop.platform?.getWebhooksFunction) {
+      return { success: false, error: "Webhook functions not configured." };
+    }
+    const expectedOrigin = requestOrigin(context);
+    if (!expectedOrigin) return { success: false, error: "Unable to determine Openship origin." };
+
+    const platform = {
+      ...(shop.metadata || {}),
+      resourceId: shop.id,
+      id: shop.platform.id,
+      domain: shop.domain,
+      accessToken: shop.accessToken,
+      getWebhooksFunction: shop.platform.getWebhooksFunction,
+      deleteWebhookFunction: shop.platform.deleteWebhookFunction,
+    };
+    const result = await executeGetShopWebhooks({ platform });
+    const webhook = (result.webhooks || []).find((item: any) => String(item.id) === webhookId);
+    if (!webhook) return { success: false, error: "Webhook not found." };
+    assertWebhookBelongsToResource({
+      kind: "shop",
+      resourceId: shopId,
+      endpoint: webhook.callbackUrl,
+      expectedOrigin,
     });
 
-    if (!shop) {
-      return { success: false, error: "Shop not found" };
-    }
-
-    if (!shop.platform) {
-      return { success: false, error: "Platform configuration not specified." };
-    }
-
-    await executeDeleteShopWebhook({
-      platform: {
-        ...shop.platform,
-        domain: shop.domain,
-        accessToken: shop.accessToken,
-      },
-      webhookId,
-    });
-
+    await executeDeleteShopWebhook({ platform, webhookId });
     return { success: true };
   } catch (error: any) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : "Webhook deletion failed" };
   }
 }
 

@@ -148,8 +148,10 @@ export function OrderListPageClient({
       } else if(response?.error) {
         throw new Error(response?.error || 'An unknown error occurred.');
       }
+      return response;
     } catch (error: any) {
       console.error('Action failed:', error.message);
+      return { success: false, error: error.message || 'Action failed' };
     }
   }
   // Hooks for sorting and field selection

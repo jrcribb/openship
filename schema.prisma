@@ -125,6 +125,7 @@ model ChannelPlatform {
   name                         String    @default("")
   appKey                       String    @default("")
   appSecret                    String    @default("")
+  webhookSecret                String?
   searchProductsFunction       String    @default("")
   getProductFunction           String    @default("")
   createPurchaseFunction       String    @default("")
@@ -153,6 +154,7 @@ model Shop {
   tokenExpiresAt DateTime?
   linkMode       String?       @default("sequential")
   metadata       Json?         @default("{}")
+  webhookSecret  String        @default("")
   platform       ShopPlatform? @relation("Shop_platform", fields: [platformId], references: [id])
   platformId     String?       @map("platform")
   user           User?         @relation("Shop_user", fields: [userId], references: [id])
@@ -175,6 +177,7 @@ model Channel {
   refreshToken   String           @default("")
   tokenExpiresAt DateTime?
   metadata       Json?            @default("{}")
+  webhookSecret  String           @default("")
   platform       ChannelPlatform? @relation("Channel_platform", fields: [platformId], references: [id])
   platformId     String?          @map("platform")
   user           User?            @relation("Channel_user", fields: [userId], references: [id])
@@ -191,7 +194,7 @@ model Channel {
 
 model Order {
   id             String     @id @default(cuid())
-  orderId        String     @unique @default("")
+  orderId        String     @default("")
   orderName      String     @default("")
   email          String     @default("")
   firstName      String     @default("")
@@ -223,6 +226,8 @@ model Order {
   createdAt      DateTime   @default(now())
   updatedAt      DateTime   @default(now())
 
+  @@unique([shopId, orderId])
+  @@index([orderId])
   @@index([shopId])
   @@index([userId])
 }
@@ -249,29 +254,32 @@ model LineItem {
 }
 
 model CartItem {
-  id              String           @id @default(cuid())
-  name            String           @default("")
-  image           String           @default("")
-  price           String           @default("")
-  quantity        Int?
-  productId       String           @default("")
-  variantId       String           @default("")
-  sku             String           @default("")
-  lineItemId      String           @default("")
-  url             String           @default("")
-  error           String           @default("")
-  purchaseId      String           @default("")
-  status          String           @default("PENDING")
-  order           Order?           @relation("CartItem_order", fields: [orderId], references: [id])
-  orderId         String?          @map("order")
-  channel         Channel?         @relation("CartItem_channel", fields: [channelId], references: [id])
-  channelId       String?          @map("channel")
-  trackingDetails TrackingDetail[] @relation("CartItem_trackingDetails")
-  user            User?            @relation("CartItem_user", fields: [userId], references: [id])
-  userId          String?          @map("user")
-  createdAt       DateTime         @default(now())
-  updatedAt       DateTime         @default(now())
+  id                 String           @id @default(cuid())
+  name               String           @default("")
+  image              String           @default("")
+  price              String           @default("")
+  quantity           Int?
+  productId          String           @default("")
+  variantId          String           @default("")
+  sku                String           @default("")
+  lineItemId         String           @default("")
+  url                String           @default("")
+  error              String           @default("")
+  purchaseId         String           @default("")
+  purchaseAttemptKey String?
+  purchaseClaimedAt  DateTime?
+  status             String           @default("PENDING")
+  order              Order?           @relation("CartItem_order", fields: [orderId], references: [id])
+  orderId            String?          @map("order")
+  channel            Channel?         @relation("CartItem_channel", fields: [channelId], references: [id])
+  channelId          String?          @map("channel")
+  trackingDetails    TrackingDetail[] @relation("CartItem_trackingDetails")
+  user               User?            @relation("CartItem_user", fields: [userId], references: [id])
+  userId             String?          @map("user")
+  createdAt          DateTime         @default(now())
+  updatedAt          DateTime         @default(now())
 
+  @@index([purchaseAttemptKey])
   @@index([orderId])
   @@index([channelId])
   @@index([userId])
@@ -348,15 +356,18 @@ model Link {
 }
 
 model TrackingDetail {
-  id              String     @id @default(cuid())
-  trackingCompany String     @default("")
-  trackingNumber  String     @default("")
-  purchaseId      String     @default("")
-  cartItems       CartItem[] @relation("CartItem_trackingDetails")
-  user            User?      @relation("TrackingDetail_user", fields: [userId], references: [id])
-  userId          String?    @map("user")
-  createdAt       DateTime   @default(now())
-  updatedAt       DateTime   @default(now())
+  id                   String     @id @default(cuid())
+  trackingCompany      String     @default("")
+  trackingNumber       String     @default("")
+  purchaseId           String     @default("")
+  dedupeKey            String?    @unique
+  fulfillmentLineItems Json?      @default("[]")
+  relayedAt            DateTime?
+  cartItems            CartItem[] @relation("CartItem_trackingDetails")
+  user                 User?      @relation("TrackingDetail_user", fields: [userId], references: [id])
+  userId               String?    @map("user")
+  createdAt            DateTime   @default(now())
+  updatedAt            DateTime   @default(now())
 
   @@index([userId])
 }

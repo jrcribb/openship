@@ -1,4 +1,11 @@
 import { createShopWebhook as executeCreateShopWebhook } from "../../utils/shopProviderAdapter";
+import {
+  ensureConnectionWebhookSecret,
+  requestOrigin,
+  requireWebhookOwner,
+  validateWebhookConfiguration,
+  webhookRegistrationKey,
+} from "./webhook-security";
 
 interface CreateShopWebhookArgs {
   shopId: string;
@@ -11,58 +18,46 @@ async function createShopWebhook(
   { shopId, topic, endpoint }: CreateShopWebhookArgs,
   context: any
 ) {
-
   try {
-    const sudoContext = context.sudo();
-
-    
-    // Fetch the shop using the provided shopId
-    const shop = await sudoContext.query.Shop.findOne({
-      where: { id: shopId },
-      query: `
-        id
-        domain
-        accessToken
-        metadata
-        platform {
-          id
-          name
-          createWebhookFunction
-        }
-      `,
-    });
-
-
-    if (!shop) {
-      return { success: false, error: "Shop not found" };
-    }
-
-    if (!shop.platform) {
-      return { success: false, error: "Platform configuration not specified." };
-    }
-
-    if (!shop.platform.createWebhookFunction) {
+    const shop = await requireWebhookOwner(context, "shop", shopId);
+    if (!shop.platform?.createWebhookFunction) {
       return { success: false, error: "Create webhook function not configured." };
     }
-
-    // Prepare platform configuration (matching getShopProduct pattern)
-    const platformConfig = {
-      domain: shop.domain,
-      accessToken: shop.accessToken,
-      createWebhookFunction: shop.platform.createWebhookFunction,
-      ...shop.metadata,
-    };
-
-    const result = await executeCreateShopWebhook({
-      platform: platformConfig,
+    const expectedOrigin = requestOrigin(context);
+    if (!expectedOrigin) {
+      return { success: false, error: "Configured Openship origin is required." };
+    }
+    const validated = validateWebhookConfiguration({
+      kind: "shop",
+      resourceId: shopId,
+      topic,
       endpoint,
-      events: [topic],
+      expectedOrigin,
     });
 
+    const webhookSecret = shop.platform.createWebhookFunction === "openfront"
+      ? await ensureConnectionWebhookSecret(context, "shop", shop)
+      : undefined;
+    const result = await executeCreateShopWebhook({
+      platform: {
+        ...(shop.metadata || {}),
+        resourceId: shop.id,
+        webhookSecret,
+        id: shop.platform.id,
+        domain: shop.domain,
+        accessToken: shop.accessToken,
+        appKey: shop.platform.appKey,
+        appSecret: shop.platform.appSecret,
+        createWebhookFunction: shop.platform.createWebhookFunction,
+      },
+      endpoint: validated.endpoint,
+      events: [validated.topic],
+      registrationKey: webhookRegistrationKey('shop', shopId, validated.topic),
+    });
 
     return { success: true, webhookId: result.webhookId };
   } catch (error: any) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : "Webhook creation failed" };
   }
 }
 

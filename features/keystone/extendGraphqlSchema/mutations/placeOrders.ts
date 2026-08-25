@@ -10,6 +10,7 @@ async function placeOrders(root: any, { ids }: { ids: string[] }, context: any) 
   const processedOrders = await placeMultipleOrders({
     ids,
     query: context.query,
+    prisma: context.prisma,
   });
 
   return processedOrders;

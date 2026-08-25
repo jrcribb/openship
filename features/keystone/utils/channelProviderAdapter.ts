@@ -94,16 +94,18 @@ export async function createChannelPurchase({
   cartItems,
   shipping,
   notes,
+  idempotencyKey,
 }: {
   platform: Platform;
   cartItems: any[];
   shipping: any;
   notes: string;
+  idempotencyKey?: string;
 }) {
   return executeChannelAdapterFunction({
     platform,
     functionName: 'createPurchaseFunction',
-    args: { cartItems, shipping, notes },
+    args: { cartItems, shipping, notes, idempotencyKey },
   });
 }
 
@@ -111,15 +113,17 @@ export async function createChannelWebhook({
   platform,
   endpoint,
   events,
+  registrationKey,
 }: {
   platform: Platform;
   endpoint: string;
   events: any[];
+  registrationKey?: string;
 }) {
   return executeChannelAdapterFunction({
     platform,
     functionName: 'createWebhookFunction',
-    args: { endpoint, events },
+    args: { endpoint, events, registrationKey },
   });
 }
 

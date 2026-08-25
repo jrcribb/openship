@@ -78,11 +78,11 @@ export async function addCartToPlatformOrder({ platform, cartItems, orderId }: a
   });
 }
 
-export async function createShopWebhook({ platform, endpoint, events }: any) {
+export async function createShopWebhook({ platform, endpoint, events, registrationKey }: any) {
   return executeShopAdapterFunction({
     platform,
     functionName: "createWebhookFunction",
-    args: { endpoint, events },
+    args: { endpoint, events, registrationKey },
   });
 }
 

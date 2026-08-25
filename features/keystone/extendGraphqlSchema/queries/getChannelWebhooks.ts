@@ -1,4 +1,5 @@
 import { getChannelWebhooks as executeGetChannelWebhooks } from "../../utils/channelProviderAdapter";
+import { requireWebhookOwner } from "../mutations/webhook-security";
 
 interface GetChannelWebhooksArgs {
   channelId: string;
@@ -10,24 +11,21 @@ async function getChannelWebhooks(
   context: any
 ) {
   try {
-    // Fetch the channel using the provided channelId
-    const channel = await context.query.Channel.findOne({
-      where: { id: channelId },
-      query: "id domain accessToken platform { id getWebhooksFunction }",
-    });
-
-    if (!channel) {
-      throw new Error("Channel not found");
-    }
-
-    if (!channel.platform) {
-      throw new Error("Platform configuration not specified.");
+    const channel = await requireWebhookOwner(context, "channel", channelId);
+    if (!channel.platform?.getWebhooksFunction) {
+      throw new Error("Get webhooks function not configured.");
     }
 
     const result = await executeGetChannelWebhooks({
-      platform: channel.platform,
+      platform: {
+        ...(channel.metadata || {}),
+        resourceId: channel.id,
+        id: channel.platform.id,
+        domain: channel.domain,
+        accessToken: channel.accessToken,
+        getWebhooksFunction: channel.platform.getWebhooksFunction,
+      },
     });
-
     return result.webhooks;
   } catch (error: any) {
     throw new Error(`Error getting channel webhooks: ${error.message}`);

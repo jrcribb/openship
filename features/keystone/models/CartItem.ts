@@ -61,6 +61,14 @@ export const CartItem = list({
       },
     }),
     purchaseId: text(),
+    purchaseAttemptKey: text({
+      isIndexed: true,
+      db: { isNullable: true },
+      ui: { itemView: { fieldMode: 'read' } },
+    }),
+    purchaseClaimedAt: timestamp({
+      ui: { itemView: { fieldMode: 'read' } },
+    }),
     status: text({ defaultValue: 'PENDING' }),
     
     // Relationships

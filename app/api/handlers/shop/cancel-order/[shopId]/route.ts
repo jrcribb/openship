@@ -7,18 +7,13 @@ export async function POST(
   { params }: { params: Promise<{ shopId: string }> }
 ) {
   try {
-    // Respond immediately to acknowledge receipt
-    const response = NextResponse.json({ received: true });
-
     // Get the webhook payload
     const body = await request.json();
     const headers = Object.fromEntries(request.headers.entries());
     const { shopId } = await params;
 
-    // Process webhook asynchronously
-    processWebhook(shopId, body, headers);
-
-    return response;
+    await processWebhook(shopId, body, headers);
+    return NextResponse.json({ received: true });
   } catch (error) {
     console.error('Error processing cancel order webhook:', error);
     return NextResponse.json({ error: 'Webhook processing failed' }, { status: 500 });
@@ -26,7 +21,6 @@ export async function POST(
 }
 
 async function processWebhook(shopId: string, body: any, headers: any) {
-  try {
     // Find the shop and its platform
     const shop = await keystoneContext.sudo().query.Shop.findOne({
       where: { id: shopId },
@@ -34,6 +28,8 @@ async function processWebhook(shopId: string, body: any, headers: any) {
         id
         domain
         accessToken
+        metadata
+        webhookSecret
         platform {
           id
           name
@@ -44,25 +40,21 @@ async function processWebhook(shopId: string, body: any, headers: any) {
       `,
     });
 
-    if (!shop) {
-      console.error(`Shop not found: ${shopId}`);
-      return;
-    }
-
-    console.log('Processing cancel webhook for shop:', shop.domain);
+    if (!shop) throw new Error(`Shop not found: ${shopId}`);
 
     // Use the shop provider adapter to handle the webhook
     const orderId = await handleShopCancelWebhook({
       platform: {
         ...shop.platform,
+        ...(shop.metadata || {}),
+        webhookSecret: shop.webhookSecret,
+        resourceId: shop.id,
         domain: shop.domain,
         accessToken: shop.accessToken,
       },
       event: body,
       headers,
     });
-
-    console.log('Order ID to cancel:', orderId);
 
     // Find the order in our database
     const [foundOrder] = await keystoneContext.sudo().query.Order.findMany({
@@ -81,11 +73,7 @@ async function processWebhook(shopId: string, body: any, headers: any) {
         query: 'id status orderId orderName',
       });
 
-      console.log('Order cancelled successfully:', updatedOrder);
-    } else {
-      console.warn(`Order not found for orderId: ${orderId} in shop: ${shopId}`);
+      return updatedOrder;
     }
-  } catch (error) {
-    console.error('Error processing cancel webhook:', error);
-  }
+    throw new Error(`Order not found for orderId: ${orderId} in shop: ${shopId}`);
 }

@@ -42,6 +42,7 @@ const typeDefs = graphql`
       variantId: String
       quantity: String
       orderId: ID
+      lineItemId: String
     ): Order
     placeOrders(ids: [ID!]!): [Order]
     addMatchToCart(orderId: ID!): Order

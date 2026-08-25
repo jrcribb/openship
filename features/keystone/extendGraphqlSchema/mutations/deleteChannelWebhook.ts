@@ -1,4 +1,12 @@
-import { deleteChannelWebhook as executeDeleteChannelWebhook } from "../../utils/channelProviderAdapter";
+import {
+  deleteChannelWebhook as executeDeleteChannelWebhook,
+  getChannelWebhooks as executeGetChannelWebhooks,
+} from "../../utils/channelProviderAdapter";
+import {
+  assertWebhookBelongsToResource,
+  requestOrigin,
+  requireWebhookOwner,
+} from "./webhook-security";
 
 interface DeleteChannelWebhookArgs {
   channelId: string;
@@ -11,32 +19,36 @@ async function deleteChannelWebhook(
   context: any
 ) {
   try {
-    // Fetch the channel using the provided channelId
-    const channel = await context.query.Channel.findOne({
-      where: { id: channelId },
-      query: "id domain accessToken platform { id deleteWebhookFunction }",
+    const channel = await requireWebhookOwner(context, "channel", channelId);
+    if (!channel.platform?.deleteWebhookFunction || !channel.platform?.getWebhooksFunction) {
+      return { success: false, error: "Webhook functions not configured." };
+    }
+    const expectedOrigin = requestOrigin(context);
+    if (!expectedOrigin) return { success: false, error: "Unable to determine Openship origin." };
+
+    const platform = {
+      ...(channel.metadata || {}),
+      resourceId: channel.id,
+      id: channel.platform.id,
+      domain: channel.domain,
+      accessToken: channel.accessToken,
+      getWebhooksFunction: channel.platform.getWebhooksFunction,
+      deleteWebhookFunction: channel.platform.deleteWebhookFunction,
+    };
+    const result = await executeGetChannelWebhooks({ platform });
+    const webhook = (result.webhooks || []).find((item: any) => String(item.id) === webhookId);
+    if (!webhook) return { success: false, error: "Webhook not found." };
+    assertWebhookBelongsToResource({
+      kind: "channel",
+      resourceId: channelId,
+      endpoint: webhook.callbackUrl,
+      expectedOrigin,
     });
 
-    if (!channel) {
-      return { success: false, error: "Channel not found" };
-    }
-
-    if (!channel.platform) {
-      return { success: false, error: "Platform configuration not specified." };
-    }
-
-    await executeDeleteChannelWebhook({
-      platform: {
-        ...channel.platform,
-        domain: channel.domain,
-        accessToken: channel.accessToken,
-      },
-      webhookId,
-    });
-
+    await executeDeleteChannelWebhook({ platform, webhookId });
     return { success: true };
   } catch (error: any) {
-    return { success: false, error: error.message };
+    return { success: false, error: error instanceof Error ? error.message : "Webhook deletion failed" };
   }
 }
 

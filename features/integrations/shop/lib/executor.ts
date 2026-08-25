@@ -75,11 +75,11 @@ export async function addCartToPlatformOrder({ platform, cartItems, orderId }: {
   });
 }
 
-export async function createShopWebhook({ platform, endpoint, events }: { platform: any; endpoint: string; events: string[] }) {
+export async function createShopWebhook({ platform, endpoint, events, registrationKey }: { platform: any; endpoint: string; events: string[]; registrationKey?: string }) {
   return executeShopAdapterFunction({
     platform,
     functionName: "createWebhookFunction",
-    args: { endpoint, events },
+    args: { endpoint, events, registrationKey },
   });
 }
 
@@ -131,10 +131,10 @@ export async function handleShopCancelWebhook({ platform, event, headers }: { pl
   });
 }
 
-export async function addShopTracking({ platform, order, trackingCompany, trackingNumber }: { platform: any; order: any; trackingCompany: string; trackingNumber: string }) {
+export async function addShopTracking({ platform, order, trackingCompany, trackingNumber, lineItems }: { platform: any; order: any; trackingCompany: string; trackingNumber: string; lineItems: Array<{ lineItemId: string; quantity: number }> }) {
   return executeShopAdapterFunction({
     platform,
     functionName: "addTrackingFunction",
-    args: { order, trackingCompany, trackingNumber },
+    args: { order, trackingCompany, trackingNumber, lineItems },
   });
 }

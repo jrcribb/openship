@@ -12,7 +12,6 @@ import { graphql } from "@keystone-6/core";
 
 import { isSignedIn, permissions, rules } from "../access";
 import { trackingFields } from "./trackingFields";
-import { getBaseUrl } from '../../dashboard/lib/getBaseUrl';
 import { executeShopAdapterFunction } from '../utils/shopProviderAdapter';
 
 export const Shop = list({
@@ -64,6 +63,10 @@ export const Shop = list({
     }),
     metadata: json({
       defaultValue: {},
+    }),
+    webhookSecret: text({
+      access: { read: () => false, create: () => false, update: () => false },
+      ui: { itemView: { fieldMode: "hidden" } },
     }),
 
     // Relationships
@@ -125,8 +128,15 @@ export const Shop = list({
             // Get platform data with relationships resolved
             const shopWithPlatform = await context.query.Shop.findOne({
               where: { id: item.id },
-              query: 'platform { getWebhooksFunction }'
+              query: 'platform { getWebhooksFunction createWebhookFunction }'
             });
+
+            if (shopWithPlatform?.platform?.createWebhookFunction === 'openfront') {
+              const unsupportedIndex = recommendedWebhooks.findIndex(
+                (webhook) => webhook.topic === 'ORDER_CHARGEBACKED'
+              );
+              if (unsupportedIndex >= 0) recommendedWebhooks.splice(unsupportedIndex, 1);
+            }
 
             if (!shopWithPlatform?.platform?.getWebhooksFunction) {
               return {
@@ -137,10 +147,11 @@ export const Shop = list({
             }
 
             const platformConfig = {
+              ...(item.metadata || {}),
+              resourceId: String(item.id),
               domain: item.domain,
               accessToken: item.accessToken,
               getWebhooksFunction: shopWithPlatform.platform.getWebhooksFunction,
-              ...(item.metadata || {}),
             };
 
             const webhooksResult = await executeShopAdapterFunction({

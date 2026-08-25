@@ -1,5 +1,4 @@
 import { GraphQLClient, gql } from "graphql-request";
-import { getBaseUrl } from '@/features/dashboard/lib/getBaseUrl';
 
 interface ShopifyPlatform {
   domain: string;
@@ -642,10 +641,9 @@ export async function getWebhooksFunction({
 
   const { webhookSubscriptions } = await shopifyClient.request(query) as any;
 
-  const baseUrl = await getBaseUrl();
   const webhooks = webhookSubscriptions.edges.map(({ node }: any) => ({
     id: node.id.split("/").pop(),
-    callbackUrl: node.endpoint.callbackUrl.replace(baseUrl, ""),
+    callbackUrl: node.endpoint.callbackUrl,
     topic: (mapTopic as any)[node.topic] || node.topic,
     format: node.format,
     createdAt: node.createdAt,
